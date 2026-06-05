@@ -201,6 +201,10 @@ class ClientConnection {
   private rafScheduled = false;
   // Inbound-video stats poller (black-screen diagnosis).
   private statsTimer: ReturnType<typeof setInterval> | null = null;
+  // The single MediaStream we attach all inbound tracks (video + audio) to.
+  private remoteStream: MediaStream | null = null;
+  // One-shot click-to-unmute handler, installed only if unmuted autoplay is blocked.
+  private unmuteOnClick: (() => void) | null = null;
   // Installed DOM listeners (for clean removal) + held keys (stuck-key safety).
   private inputListenersInstalled = false;
   private domCleanup: Array<() => void> = [];
@@ -340,16 +344,22 @@ class ClientConnection {
       }
     };
 
-    // Incoming media: attach the first track's stream to the <video>.
+    // Incoming media: video AND (optionally) audio arrive as SEPARATE tracks.
+    // We keep ONE MediaStream we control and add every inbound track to it, so a
+    // second (audio) track never displaces the video regardless of how the peer
+    // groups msids. Then we try to play UNMUTED; if the browser blocks unmuted
+    // autoplay we fall back to muted playback (video always shows) and unmute on
+    // the next user click.
+    this.remoteStream = new MediaStream();
     pc.ontrack = (ev) => {
-      const stream = ev.streams[0] ?? new MediaStream([ev.track]);
-      if (this.video.srcObject !== stream) {
-        this.video.srcObject = stream;
-        // autoplay+muted should start playback, but call play() to be safe.
-        void this.video.play().catch(() => {
-          /* ignored: autoplay policy / interrupted */
-        });
+      const s = this.remoteStream;
+      if (s && !s.getTracks().includes(ev.track)) {
+        s.addTrack(ev.track);
       }
+      if (this.video.srcObject !== s) {
+        this.video.srcObject = s;
+      }
+      this.tryPlayWithAudio();
     };
 
     // The HOST creates the "input" DataChannel; we receive it here.
@@ -406,6 +416,35 @@ class ClientConnection {
       clearInterval(this.statsTimer);
       this.statsTimer = null;
     }
+  }
+
+  /**
+   * Start playback, preferring AUDIBLE play. Browsers block unmuted autoplay
+   * without a user gesture; if that happens we keep the video playing MUTED (so
+   * the picture is never lost) and arm a one-shot click handler that unmutes.
+   */
+  private tryPlayWithAudio(): void {
+    const v = this.video;
+    v.muted = false;
+    v.play().catch(() => {
+      // Unmuted play rejected: fall back to muted so video still shows...
+      v.muted = true;
+      void v.play().catch(() => {
+        /* ignored: still interrupted; will retry on next track/gesture */
+      });
+      // ...and unmute on the next click anywhere (a real user gesture).
+      if (!this.unmuteOnClick) {
+        this.unmuteOnClick = () => {
+          this.video.muted = false;
+          void this.video.play().catch(() => {});
+          if (this.unmuteOnClick) {
+            window.removeEventListener("click", this.unmuteOnClick);
+            this.unmuteOnClick = null;
+          }
+        };
+        window.addEventListener("click", this.unmuteOnClick);
+      }
+    });
   }
 
   private async handleOffer(msg: OfferMsg): Promise<void> {
@@ -659,6 +698,11 @@ class ClientConnection {
     }
     if (this.video.srcObject) {
       this.video.srcObject = null;
+    }
+    this.remoteStream = null;
+    if (this.unmuteOnClick) {
+      window.removeEventListener("click", this.unmuteOnClick);
+      this.unmuteOnClick = null;
     }
   }
 

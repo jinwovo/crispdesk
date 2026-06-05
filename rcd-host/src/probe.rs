@@ -310,6 +310,27 @@ pub fn probe_all() -> Result<Probed> {
     Ok(Probed { encoder, capture })
 }
 
+/// Whether to add a system-audio (loopback) track. Audio is ADDITIVE: if anything
+/// here is missing we stream video-only, so audio can never break the video path.
+/// Disable explicitly with `AUDIO=0`. We gate on element PRESENCE only (not a buffer
+/// probe) because WASAPI loopback legitimately yields no buffers while the system is
+/// silent — that must NOT disable audio.
+pub fn audio_available() -> bool {
+    if std::env::var("AUDIO").as_deref() == Ok("0") {
+        tracing::info!("AUDIO=0 -> system audio disabled");
+        return false;
+    }
+    let ok = factory_present("wasapi2src")
+        && factory_present("opusenc")
+        && factory_present("rtpopuspay");
+    if ok {
+        tracing::info!("system audio available (wasapi2src loopback + Opus)");
+    } else {
+        tracing::warn!("system-audio elements missing; streaming VIDEO ONLY");
+    }
+    ok
+}
+
 /// `cargo run -- probe`: print, without streaming, exactly what THIS machine supports.
 /// Handy first diagnostic on any host (especially this Snapdragon, where it should
 /// pick gdi/d3d11 capture + a software encoder).

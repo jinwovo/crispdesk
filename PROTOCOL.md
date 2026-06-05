@@ -225,8 +225,29 @@ units and flips the vertical sign (JS `+`=down, Windows `+`=up). Host injects vi
 ## 3. Media (reference)
 
 - **Video codec:** H.264, 4:2:0 (M1). HEVC, 4:4:4, and AV1 are intentionally
-  **not** used in M1.
-- **Host pipeline tail:**
-  `... -> h264parse config-interval=-1 -> rtph264pay aggregate-mode=zero-latency pt=96 -> webrtcbin`.
-- **Client:** receives the track via `pc.ontrack` and renders it in a fullscreen
-  `<video>` element.
+  **not** used in M1. Payload type **96**.
+- **Audio codec:** Opus, 48 kHz stereo. Payload type **97**. The host captures
+  **system output** via WASAPI loopback (`wasapi2src loopback=true`). Audio is
+  **additive**: if the audio elements are absent or `AUDIO=0` is set, the host
+  streams **video-only** — audio can never break the video path.
+- **Host pipeline tail (video):**
+  `... -> h264parse config-interval=-1 -> rtph264pay aggregate-mode=zero-latency pt=96 mtu=1200 -> webrtcbin`.
+  - **`mtu=1200`** is REQUIRED, not optional: it is the libwebrtc-standard RTP
+    packet size and keeps keyframe fragments under the smallest common path MTU
+    (e.g. a WireGuard/Tailscale tunnel is 1280). The GStreamer default of 1400
+    fragments large keyframes at the IP layer; a single lost fragment then
+    prevents the browser from ever assembling the keyframe — a fully-connected
+    transport with a permanently **black screen** and a climbing `pliCount`.
+- **Host pipeline tail (audio, when enabled):**
+  `wasapi2src loopback=true low-latency=true -> audioconvert -> audioresample -> opusenc -> rtpopuspay pt=97 -> webrtcbin`.
+- **Resolution:** the encoded video is scaled (on the GPU for d3d11 capture) to a
+  cap — default **1920x1080**; `RES=native` streams the full desktop, `RES=WxH`
+  sets an explicit cap. `BITRATE=<kbps>` tunes the encoder (default 12000).
+- **Transport:** `webrtcbin` uses **`bundle-policy=max-bundle`** so video, audio,
+  and the DataChannel share **one** ICE transport (the default policy can connect
+  the data transport while a separate video transport fails). A fresh
+  pipeline+webrtcbin is built **per client session** so a client may
+  refresh/reconnect freely.
+- **Client:** receives each track via `pc.ontrack`, adds it to one `MediaStream`,
+  and renders it in a fullscreen `<video>` element (video shows muted; audio is
+  unmuted on play, falling back to a click-to-unmute if the browser blocks it).

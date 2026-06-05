@@ -77,19 +77,38 @@ pub fn capture_to_rtp_chain(probed: &Probed, webrtcbin_name: &str) -> String {
     // Scale to the target resolution on the GPU (see convert_and_scale). Default
     // 1080p; RES=native streams the full desktop; RES=WxH sets an explicit cap.
     let conv = convert_and_scale(probed.capture.kind, target_res());
+    let mtu = std::env::var("RTP_MTU").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1200);
 
-    format!(
+    let video = format!(
         "{src} ! {conv} ! \
          {enc} name=venc {tuning} ! \
          h264parse config-interval=-1 ! \
          rtph264pay aggregate-mode=zero-latency pt=96 mtu={mtu} ! \
          application/x-rtp,media=video,encoding-name=H264,payload=96 ! \
          {webrtcbin_name}.",
-        mtu = std::env::var("RTP_MTU").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1200),
         src = probed.capture.desc,
         enc = probed.encoder.element,
         tuning = probed.encoder.tuning,
-    )
+    );
+
+    // Optional second branch: system audio (loopback) -> Opus -> a separate audio
+    // m-line on the SAME webrtcbin. Only added when audio_available() (env + element
+    // presence) so it can never break the video-only path.
+    let audio = if crate::probe::audio_available() {
+        format!(
+            " wasapi2src loopback=true low-latency=true ! \
+             audioconvert ! audioresample ! \
+             audio/x-raw,rate=48000,channels=2 ! \
+             opusenc ! \
+             rtpopuspay pt=97 ! \
+             application/x-rtp,media=audio,encoding-name=OPUS,payload=97 ! \
+             {webrtcbin_name}."
+        )
+    } else {
+        String::new()
+    };
+
+    format!("{video}{audio}")
 }
 
 /// PREVIEW mode: self-contained pipeline that exercises capture + encode + decode with
