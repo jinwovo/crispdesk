@@ -1,0 +1,20 @@
+{
+  // Build config for the Electron MAIN process and the PRELOAD script.
+  //
+  // Electron loads dist/main.js and dist/preload.js with its own loader, NOT the
+  // browser. Sandboxed preloads must be CommonJS, and the main process relies on
+  // `require('electron')` and the CommonJS global `__dirname` (used by main.ts to
+  // resolve preload.js and index.html). So we emit CommonJS here.
+  //
+  // "moduleResolution":"node" pairs with CommonJS emit ("bundler" resolution does
+  // not). These files run on Node, so they get the Node type definitions and no
+  // DOM lib.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "lib": ["ES2022"],
+    "types": ["node"]
+  },
+  "include": ["src/main.ts", "src/preload.ts"]
+}

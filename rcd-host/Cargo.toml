@@ -1,0 +1,49 @@
+[package]
+name = "rcd-host"
+version = "0.1.0"
+edition = "2021"
+description = "rcd (remote control desktop) HOST: captures the Windows screen, NVENC-encodes H.264, and streams it over WebRTC (webrtcbin) to the Electron client. The host is the OFFERER and receives mouse input over a DataChannel."
+license = "MIT OR Apache-2.0"
+
+# NOTE ON VERSIONS:
+# These pin the gstreamer-rs family to the 0.23 line, which targets GStreamer
+# 1.24+. The *bindings* (gstreamer = "0.23") and the *installed* GStreamer runtime
+# must be compatible: gstreamer-rs 0.23 needs GStreamer >= 1.24. If the user
+# installs a different GStreamer (e.g. 1.26), bump these crate versions to the
+# matching gstreamer-rs release (check https://gitlab.freedesktop.org/gstreamer/gstreamer-rs)
+# and re-run `cargo update`. The webrtcbin signal/promise API surface is the part
+# most sensitive to version drift -- see TODO(on-device) notes in src/webrtc.rs.
+[dependencies]
+# --- GStreamer (the gstreamer-rs 0.23 family) ---
+gstreamer = "0.23"
+gstreamer-webrtc = "0.23"
+gstreamer-sdp = "0.23"
+# gstreamer-app: AppSink used by the encoder/capture run-probe (src/probe.rs).
+gstreamer-app = "0.23"
+# glib 0.20 is the version re-exported by gstreamer-rs 0.23; keep them in lockstep.
+glib = "0.20"
+
+# --- Async runtime + WebSocket signaling client ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+# --- Serialization for the pinned signaling protocol ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- Misc ---
+anyhow = "1"
+url = "2"
+
+# --- Windows input injection (SetCursorPos / SendInput) for the "input" DataChannel ---
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+
+# --- Logging ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "rcd-host"
+path = "src/main.rs"

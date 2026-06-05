@@ -1,0 +1,30 @@
+{
+  // Base TypeScript config shared by the two build targets in this Electron app.
+  //
+  // The client has two very different runtimes that must NOT share lib/types:
+  //   * main process + preload  -> Node/Electron, loaded by Electron's CommonJS
+  //                                loader. Needs Node globals (process, __dirname)
+  //                                and MUST emit CommonJS (sandboxed preloads are
+  //                                always CommonJS; `require('electron')` must work).
+  //   * renderer                -> pure browser, loaded as <script type="module">.
+  //                                Needs DOM types (WebSocket, RTCPeerConnection,
+  //                                HTMLVideoElement, DataView, ...) and must NOT see
+  //                                Node globals (recent @types/node declares global
+  //                                WebSocket/MessageEvent/CloseEvent that collide
+  //                                with the DOM lib and would break type-checking).
+  //
+  // So we DO NOT compile everything with one config. tsconfig.main.json and
+  // tsconfig.renderer.json each extend this base and own their module/lib/types.
+  // The npm "build" script runs both. This file itself compiles nothing.
+  "compilerOptions": {
+    "target": "ES2022",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "sourceMap": true
+  },
+  "files": []
+}

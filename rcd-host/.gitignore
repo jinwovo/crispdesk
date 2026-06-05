@@ -1,0 +1,4 @@
+# Rust build artifacts (this crate). The repo-root .gitignore is owned by the docs agent.
+/target
+**/*.rs.bk
+# Cargo.lock IS committed for binaries (reproducible host builds).

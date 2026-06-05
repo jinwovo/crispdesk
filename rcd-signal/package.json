@@ -1,0 +1,21 @@
+{
+  "name": "rcd-signal",
+  "version": "0.1.0",
+  "private": true,
+  "description": "rcd (remote control desktop) signaling server — WebSocket relay that brokers WebRTC negotiation between the Rust host and the Electron client.",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsc && node dist/server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/ws": "^8.5.12",
+    "@types/node": "^22.5.0"
+  }
+}

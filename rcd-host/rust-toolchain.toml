@@ -1,0 +1,19 @@
+# Pin this project to the ARM64-NATIVE MSVC Rust toolchain.
+#
+# WHY ARM64-native: this dev machine is a Snapdragon X / ARM64 Surface and we build
+# against the native ARM64 GStreamer (1.28.x, gstreamer-1.0-msvc-arm64 installer).
+# Native ARM64 is the ONLY path that can reach the Adreno hardware encoder via
+# Media Foundation (mfh264enc) — an emulated x64 process cannot. It also runs the
+# compiler natively (no x64 emulation tax).
+#
+# REQUIREMENT (verified missing on this machine 2026-06-05): the MSVC ARM64 build
+# tools component — Visual Studio Installer -> Build Tools 2022 -> Modify ->
+# Individual components -> "MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools".
+# Without it, linking fails (no ARM64-targeting link.exe).
+#
+# On a normal x86_64 GPU host PC (NVIDIA/AMD/Intel): switch this to
+# "stable-x86_64-pc-windows-msvc" and install the x86_64 MSVC GStreamer instead
+# (that toolchain is also already installed here).
+# NEVER use a -gnu toolchain: Windows GStreamer builds are MSVC-ABI and won't link.
+[toolchain]
+channel = "stable-aarch64-pc-windows-msvc"

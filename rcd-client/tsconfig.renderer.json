@@ -1,0 +1,20 @@
+{
+  // Build config for the RENDERER (pure browser code).
+  //
+  // index.html loads dist/renderer/renderer.js as <script type="module">, so we
+  // emit native ES modules. The renderer is browser-only: it gets the DOM lib
+  // (WebSocket, RTCPeerConnection, MediaStream, HTMLVideoElement, DataView, ...)
+  // and explicitly NO Node types ("types":[]). Excluding @types/node here avoids
+  // the duplicate/incompatible global declarations (WebSocket, MessageEvent,
+  // CloseEvent) that recent @types/node adds and that would otherwise clash with
+  // the DOM lib — and it correctly keeps Node globals (process, Buffer) out of
+  // browser code.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "types": []
+  },
+  "include": ["src/renderer/**/*.ts"]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "rcd-client",
+  "version": "0.1.0",
+  "description": "rcd (remote control desktop) — Electron client (WebRTC answerer): shows host video, sends mouse input.",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.main.json && tsc -p tsconfig.renderer.json",
+    "start": "npm run build && electron ."
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "electron": "^31.0.0",
+    "typescript": "^5.5.0"
+  }
+}
