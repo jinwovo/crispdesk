@@ -59,6 +59,22 @@ fn mouse_input(flags: MOUSE_EVENT_FLAGS, data: i32) -> INPUT {
     }
 }
 
+/// Primary monitor size in pixels (logical / DPI-scaled). The ASPECT RATIO is
+/// correct regardless of DPI scaling, which is exactly what the encoder scaler
+/// needs to avoid letterbox bars (those would break the normalized input mapping).
+pub fn primary_resolution() -> Option<(u32, u32)> {
+    // SAFETY: plain Win32 FFI calls.
+    unsafe {
+        let w = GetSystemMetrics(SM_CXSCREEN);
+        let h = GetSystemMetrics(SM_CYSCREEN);
+        if w > 0 && h > 0 {
+            Some((w as u32, h as u32))
+        } else {
+            None
+        }
+    }
+}
+
 /// 0x01 — move the cursor to a normalized (0..1) position on the primary monitor.
 pub fn mouse_move_abs(nx: f32, ny: f32) {
     let nx = nx.clamp(0.0, 1.0);

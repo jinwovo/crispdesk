@@ -31,11 +31,12 @@ fn conversion(kind: CaptureKind) -> &'static str {
     }
 }
 
-/// Target encode resolution, parsed from the `RES` env var:
-///   unset       -> 1080p cap (good sharpness/latency balance; browser decodes fine)
+/// The resolution CAP from the `RES` env var (the encoded frame is fit WITHIN this
+/// while preserving the desktop's aspect ratio — see `scaled_dims`):
+///   unset       -> 1080p cap (good sharpness/latency balance)
 ///   "native"    -> no scaling (full desktop resolution; heaviest)
 ///   "WxH"       -> explicit cap, e.g. "1280x720"
-fn target_res() -> Option<(u32, u32)> {
+fn res_cap() -> Option<(u32, u32)> {
     match std::env::var("RES").ok().as_deref() {
         Some("native") => None,
         Some(res) if res.contains('x') => {
@@ -48,21 +49,39 @@ fn target_res() -> Option<(u32, u32)> {
     }
 }
 
-/// Convert a capture source's output to system NV12, scaling to `res` if given.
+/// Compute the EXACT encode dimensions: the desktop fit within the cap, preserving
+/// aspect ratio (NEVER upscaling), rounded to even numbers (H.264 needs even dims).
+///
+/// Matching the desktop's aspect ratio exactly means the encoded frame IS the
+/// desktop with NO letterbox bars. That is essential for input: the client sends
+/// mouse positions normalized to the video content (0..1) and the host maps them
+/// across the full desktop — baked-in black bars would offset every coordinate and
+/// make clicks miss (cursor "moves but doesn't land"). Returns None for "native".
+fn scaled_dims() -> Option<(u32, u32)> {
+    let cap = res_cap()?; // None => native, no scaling
+    let (sw, sh) = crate::input::primary_resolution().unwrap_or(cap);
+    let scale = (cap.0 as f64 / sw as f64)
+        .min(cap.1 as f64 / sh as f64)
+        .min(1.0); // never upscale
+    let even = |v: f64| ((v.round() as u32) & !1).max(2);
+    Some((even(sw as f64 * scale), even(sh as f64 * scale)))
+}
+
+/// Convert a capture source's output to system NV12, scaling to exact `dims` if given.
 /// Scaling is done WHERE IT'S CHEAPEST: on the GPU (d3d11convert) for d3d11 capture
 /// — so only the already-downscaled frame is copied GPU->system and there is NO
-/// per-frame CPU videoscale (the previous big latency/CPU cost). `add-borders=true`
-/// keeps aspect ratio (pillar/letterbox) instead of stretching.
-fn convert_and_scale(kind: CaptureKind, res: Option<(u32, u32)>) -> String {
-    match (kind, res) {
+/// per-frame CPU videoscale. NO `add-borders`: `dims` already matches the desktop
+/// aspect ratio, so the frame fills exactly with no bars (see `scaled_dims`).
+fn convert_and_scale(kind: CaptureKind, dims: Option<(u32, u32)>) -> String {
+    match (kind, dims) {
         (CaptureKind::D3d11, Some((w, h))) => format!(
-            "d3d11convert add-borders=true ! \
+            "d3d11convert ! \
              video/x-raw(memory:D3D11Memory),width={w},height={h} ! \
              d3d11download ! videoconvert"
         ),
         (CaptureKind::D3d11, None) => "d3d11convert ! d3d11download ! videoconvert".to_string(),
         (CaptureKind::System, Some((w, h))) => format!(
-            "videoconvert ! videoscale add-borders=true ! video/x-raw,width={w},height={h}"
+            "videoconvert ! videoscale ! video/x-raw,width={w},height={h}"
         ),
         (CaptureKind::System, None) => "videoconvert".to_string(),
     }
@@ -74,9 +93,9 @@ fn convert_and_scale(kind: CaptureKind, res: Option<(u32, u32)>) -> String {
 /// and the payloader targets it. Ends exactly as pinned by PROTOCOL.md:
 ///   `... ! h264parse config-interval=-1 ! rtph264pay aggregate-mode=zero-latency pt=96`
 pub fn capture_to_rtp_chain(probed: &Probed, webrtcbin_name: &str) -> String {
-    // Scale to the target resolution on the GPU (see convert_and_scale). Default
-    // 1080p; RES=native streams the full desktop; RES=WxH sets an explicit cap.
-    let conv = convert_and_scale(probed.capture.kind, target_res());
+    // Scale to exact aspect-correct dimensions on the GPU (see convert_and_scale /
+    // scaled_dims). Default fits within 1080p; RES=native streams the full desktop.
+    let conv = convert_and_scale(probed.capture.kind, scaled_dims());
     let mtu = std::env::var("RTP_MTU").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1200);
 
     let video = format!(
