@@ -27,6 +27,7 @@
 //!     present negotiates WebRTC and streams video while logging mouse input.
 //! ==========================================================================
 
+mod abr;
 mod input;
 mod pipeline;
 mod probe;

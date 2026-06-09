@@ -62,6 +62,10 @@ struct AppState {
 struct Session {
     pipeline: gst::Pipeline,
     state: Arc<AppState>,
+    /// The encoder element ("venc"), kept so adaptive bitrate can retune it live.
+    venc: Option<gst::Element>,
+    /// Per-session adaptive-bitrate controller (see abr.rs).
+    abr: crate::abr::AbrState,
     _bus_watch: gst::bus::BusWatchGuard,
 }
 
@@ -96,6 +100,10 @@ pub async fn run() -> Result<()> {
     let mut session: Option<Session> = None;
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
 
+    // Drive adaptive bitrate once per second whenever a session is live.
+    let mut abr_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    abr_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             biased;
@@ -111,6 +119,17 @@ pub async fn run() -> Result<()> {
                     break;
                 };
                 handle_signal(&mut session, &sig.outbound, &probed, msg);
+            }
+
+            _ = abr_tick.tick() => {
+                if let Some(s) = session.as_mut() {
+                    // Clone the (refcounted) elements so the &mut borrow of `s.abr`
+                    // doesn't conflict with the &borrows of webrtcbin/venc.
+                    let wb = s.state.webrtcbin.clone();
+                    if let Some(venc) = s.venc.clone() {
+                        s.abr.tick(&wb, &venc);
+                    }
+                }
             }
         }
     }
@@ -185,9 +204,16 @@ fn start_session(
         return;
     }
 
+    // Adaptive bitrate retunes this session's encoder; grab it by the name set in
+    // pipeline.rs ("venc"). Absent only if the pipeline shape changed.
+    let venc = pipeline.by_name("venc");
+    let abr = crate::abr::AbrState::new(probed.encoder.element.clone());
+
     *session = Some(Session {
         pipeline,
         state,
+        venc,
+        abr,
         _bus_watch: watch,
     });
 }
