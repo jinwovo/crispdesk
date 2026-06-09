@@ -14,6 +14,9 @@
 //!   * the secure desktop / UAC requires running as a LocalSystem service (later);
 //!   * gamepad (0x05) via ViGEmBus.
 
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
@@ -28,6 +31,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // XBUTTON1/2 values for MOUSEINPUT.mouseData (hardcoded to dodge per-version const types).
 const XBUTTON1_DATA: i32 = 0x0001;
 const XBUTTON2_DATA: i32 = 0x0002;
+
+// Currently-held keys (scan, extended) and mouse buttons, so we can force-release
+// them if the client vanishes WITHOUT sending key/button-ups (crash, network drop,
+// tab close). Without this the host is left with stuck modifiers (Ctrl/Alt/Shift) —
+// a notoriously confusing failure. The client has its own blur-time release; this is
+// the host-side backstop for when the client never gets the chance.
+static HELD_KEYS: LazyLock<Mutex<HashSet<(u16, bool)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static HELD_BUTTONS: LazyLock<Mutex<HashSet<u8>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Inject a single INPUT event, logging (not failing) on rejection.
 fn send_one(input: INPUT) {
@@ -114,6 +126,14 @@ pub fn mouse_button(button: u8, down: bool) {
             return;
         }
     };
+    // Track held state for the disconnect backstop (see release_all).
+    if let Ok(mut held) = HELD_BUTTONS.lock() {
+        if down {
+            held.insert(button);
+        } else {
+            held.remove(&button);
+        }
+    }
     send_one(mouse_input(flags, data));
 }
 
@@ -131,6 +151,20 @@ pub fn wheel(dx: i16, dy: i16) {
 /// `extended` marks the 0xE0-prefixed keys (right ctrl/alt, arrows, ins/del/home/end/
 /// pgup/pgdn, numpad-divide, numpad-enter, win keys).
 pub fn key_scan(scan: u16, down: bool, extended: bool) {
+    // Track held state for the disconnect backstop (see release_all).
+    if let Ok(mut held) = HELD_KEYS.lock() {
+        if down {
+            held.insert((scan, extended));
+        } else {
+            held.remove(&(scan, extended));
+        }
+    }
+    send_key(scan, down, extended);
+}
+
+/// Emit a single key event WITHOUT touching the held-state set (used by both
+/// `key_scan` and `release_all`).
+fn send_key(scan: u16, down: bool, extended: bool) {
     let mut flags = KEYEVENTF_SCANCODE;
     if !down {
         flags = flags | KEYEVENTF_KEYUP;
@@ -151,4 +185,34 @@ pub fn key_scan(scan: u16, down: bool, extended: bool) {
         },
     };
     send_one(input);
+}
+
+/// Force-release every key and mouse button we believe is held. Called when the
+/// client disconnects so a dropped connection can't leave stuck modifiers / buttons
+/// on the host desktop. Idempotent.
+pub fn release_all() {
+    let keys: Vec<(u16, bool)> = HELD_KEYS
+        .lock()
+        .map(|mut h| h.drain().collect())
+        .unwrap_or_default();
+    let buttons: Vec<u8> = HELD_BUTTONS
+        .lock()
+        .map(|mut h| h.drain().collect())
+        .unwrap_or_default();
+
+    if keys.is_empty() && buttons.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "release_all: releasing {} held key(s) and {} button(s)",
+        keys.len(),
+        buttons.len()
+    );
+    for (scan, extended) in keys {
+        send_key(scan, false, extended);
+    }
+    for button in buttons {
+        // `mouse_button(_, false)` also clears HELD_BUTTONS, harmlessly (already drained).
+        mouse_button(button, false);
+    }
 }

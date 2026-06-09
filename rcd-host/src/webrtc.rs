@@ -73,12 +73,7 @@ struct Session {
 pub async fn run() -> Result<()> {
     let (signal_url, pairing_code) = signaling::config_from_env();
 
-    // 1) Connect to signaling and join as host.
-    let mut sig = signaling::connect(&signal_url, &pairing_code)
-        .await
-        .context("signaling connect failed")?;
-
-    // 2) Probe once for a working encoder + capture source (reused for every session).
+    // Probe ONCE for a working encoder + capture source (reused across reconnects).
     let probed = crate::probe::probe_all().context("encoder/capture probe failed")?;
     tracing::info!(
         "Using encoder '{}' ({:?}) + capture '{}'",
@@ -87,51 +82,87 @@ pub async fn run() -> Result<()> {
         probed.capture.desc
     );
 
-    // 3) Drive a shared GLib main loop on a dedicated thread: webrtcbin signals,
-    //    bus watches, and promises are serviced here for ALL sessions.
+    // Drive a shared GLib main loop on a dedicated thread: webrtcbin signals, bus
+    // watches, and promises are serviced here for ALL sessions.
     let main_loop = glib::MainLoop::new(None, false);
     {
         let main_loop = main_loop.clone();
         std::thread::spawn(move || main_loop.run());
     }
 
-    tracing::info!("Host ready; waiting for a client to join room '{pairing_code}'...");
-
     let mut session: Option<Session> = None;
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    let mut backoff_secs = 1u64;
 
-    // Drive adaptive bitrate once per second whenever a session is live.
-    let mut abr_tick = tokio::time::interval(std::time::Duration::from_secs(1));
-    abr_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            biased;
-
-            _ = &mut ctrl_c => {
-                tracing::info!("Ctrl-C received; shutting down.");
-                break;
+    // Outer RECONNECT loop: the host stays up and keeps re-joining the room across
+    // signaling drops (e.g. a self-hosted server / NAS rebooting). Ctrl-C exits.
+    'reconnect: loop {
+        // Connect (abortable by Ctrl-C). On failure, back off and retry.
+        let sig = tokio::select! {
+            _ = &mut ctrl_c => break 'reconnect,
+            r = signaling::connect(&signal_url, &pairing_code) => r,
+        };
+        let mut sig = match sig {
+            Ok(s) => {
+                backoff_secs = 1;
+                s
             }
-
-            maybe_msg = sig.inbound.recv() => {
-                let Some(msg) = maybe_msg else {
-                    tracing::warn!("signaling channel closed; exiting.");
-                    break;
-                };
-                handle_signal(&mut session, &sig.outbound, &probed, msg);
+            Err(e) => {
+                tracing::error!("signaling connect failed: {e:?}; retrying in {backoff_secs}s");
+                tokio::select! {
+                    _ = &mut ctrl_c => break 'reconnect,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                }
+                backoff_secs = (backoff_secs * 2).min(30);
+                continue 'reconnect;
             }
+        };
 
-            _ = abr_tick.tick() => {
-                if let Some(s) = session.as_mut() {
-                    // Clone the (refcounted) elements so the &mut borrow of `s.abr`
-                    // doesn't conflict with the &borrows of webrtcbin/venc.
-                    let wb = s.state.webrtcbin.clone();
-                    if let Some(venc) = s.venc.clone() {
-                        s.abr.tick(&wb, &venc);
+        tracing::info!("Host ready; waiting for a client to join room '{pairing_code}'...");
+
+        // Drive adaptive bitrate once per second whenever a session is live.
+        let mut abr_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        abr_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Inner loop: service this signaling connection until it drops or Ctrl-C.
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = &mut ctrl_c => {
+                    tracing::info!("Ctrl-C received; shutting down.");
+                    break 'reconnect;
+                }
+
+                maybe_msg = sig.inbound.recv() => {
+                    let Some(msg) = maybe_msg else {
+                        tracing::warn!("signaling connection lost; tearing down and reconnecting");
+                        break; // inner break -> reconnect
+                    };
+                    handle_signal(&mut session, &sig.outbound, &probed, msg);
+                }
+
+                _ = abr_tick.tick() => {
+                    if let Some(s) = session.as_mut() {
+                        // Clone the (refcounted) elements so the &mut borrow of `s.abr`
+                        // doesn't conflict with the &borrows of webrtcbin/venc.
+                        let wb = s.state.webrtcbin.clone();
+                        if let Some(venc) = s.venc.clone() {
+                            s.abr.tick(&wb, &venc);
+                        }
                     }
                 }
             }
         }
+
+        // Signaling dropped: the peer is unreachable, so end the session (which also
+        // releases any stuck keys), then reconnect after a short backoff.
+        teardown_session(&mut session);
+        tokio::select! {
+            _ = &mut ctrl_c => break 'reconnect,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+        }
+        backoff_secs = (backoff_secs * 2).min(30);
     }
 
     teardown_session(&mut session);
@@ -145,6 +176,9 @@ fn teardown_session(session: &mut Option<Session>) {
         if let Err(e) = s.pipeline.set_state(gst::State::Null) {
             tracing::warn!("failed to set old session pipeline to NULL: {e}");
         }
+        // Backstop: a client that vanished without sending key/button-ups must not
+        // leave stuck modifiers or held mouse buttons on the host desktop.
+        crate::input::release_all();
         tracing::info!("session torn down");
     }
 }
@@ -410,9 +444,22 @@ fn build_pipeline(
     {
         let state = state.clone();
         webrtcbin.connect("on-ice-candidate", false, move |values| {
-            // Signal args: (webrtcbin, mlineindex: u32, candidate: String)
-            let mlineindex = values[1].get::<u32>().expect("mlineindex");
-            let candidate = values[2].get::<String>().expect("candidate");
+            // Signal args: (webrtcbin, mlineindex: u32, candidate: String). Be
+            // defensive: a malformed emission must log, not panic the GLib thread.
+            let mlineindex = match values.get(1).and_then(|v| v.get::<u32>().ok()) {
+                Some(m) => m,
+                None => {
+                    tracing::warn!("on-ice-candidate: missing/invalid mlineindex; ignoring");
+                    return None;
+                }
+            };
+            let candidate = match values.get(2).and_then(|v| v.get::<String>().ok()) {
+                Some(c) => c,
+                None => {
+                    tracing::warn!("on-ice-candidate: missing/invalid candidate; ignoring");
+                    return None;
+                }
+            };
             tracing::debug!("local ICE candidate (mline={mlineindex}): {candidate}");
 
             let msg = SignalMessage::Ice {

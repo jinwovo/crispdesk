@@ -134,18 +134,36 @@ pub async fn connect(signal_url: &str, pairing_code: &str) -> Result<Signaling> 
         .context("failed to send join message")?;
     tracing::info!("Sent join (room={pairing_code}, role=host)");
 
-    // Outbound pump: drain the mpsc channel onto the websocket.
+    // Outbound pump: drain the mpsc channel onto the websocket, and send a periodic
+    // keepalive Ping so idle NAT mappings / proxies (e.g. a self-hosted NAS behind a
+    // home router) don't silently drop a long-lived connection.
     tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            match serde_json::to_string(&msg) {
-                Ok(json) => {
-                    tracing::debug!("-> signaling: {json}");
-                    if let Err(e) = ws_sink.send(WsMessage::Text(json.into())).await {
-                        tracing::error!("signaling send failed: {e}");
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(20));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        keepalive.tick().await; // consume the immediate first tick
+        loop {
+            tokio::select! {
+                maybe_msg = out_rx.recv() => {
+                    let Some(msg) = maybe_msg else { break };
+                    match serde_json::to_string(&msg) {
+                        Ok(json) => {
+                            tracing::debug!("-> signaling: {json}");
+                            if let Err(e) = ws_sink.send(WsMessage::Text(json.into())).await {
+                                tracing::error!("signaling send failed: {e}");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to serialize outbound signaling message: {e}")
+                        }
+                    }
+                }
+                _ = keepalive.tick() => {
+                    if let Err(e) = ws_sink.send(WsMessage::Ping(Vec::new().into())).await {
+                        tracing::warn!("signaling keepalive ping failed: {e}");
                         break;
                     }
                 }
-                Err(e) => tracing::error!("failed to serialize outbound signaling message: {e}"),
             }
         }
         tracing::debug!("signaling outbound pump finished");

@@ -34,7 +34,6 @@ serde_json = "1"
 
 # --- Misc ---
 anyhow = "1"
-url = "2"
 
 # --- Windows input injection (SetCursorPos / SendInput) for the "input" DataChannel ---
 [target.'cfg(windows)'.dependencies]
