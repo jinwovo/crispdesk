@@ -128,6 +128,34 @@ Signaling server env: `DEV_MODE=true` uses a fixed `PAIRING_CODE`; otherwise eac
 host is issued a random code (`CODE_TTL_MS`, default 5 min) shown in the host log,
 with per-IP join rate-limiting (`JOIN_MAX_ATTEMPTS`/`JOIN_WINDOW_MS`).
 
+### TURN relay for cross-NAT (M1b — code wired, needs a coturn server)
+
+Without a TURN relay, connections only work on the same LAN or via an overlay like
+Tailscale. To connect across NATs/CGNAT, run **coturn** (e.g. on a NAS or VPS) and
+point the signaling server at it. The server then mints **ephemeral** TURN
+credentials per session (coturn `use-auth-secret` scheme) and pushes them to both
+peers via the `ice-servers` message — no static TURN password ships in any client.
+
+```ini
+# /etc/turnserver.conf (coturn)
+listening-port=3478
+tls-listening-port=5349
+use-auth-secret
+static-auth-secret=<LONG_RANDOM_SECRET>   # must match TURN_SECRET below
+realm=crispdesk
+# (for TLS) cert=/path/fullchain.pem  pkey=/path/privkey.pem
+```
+
+```powershell
+# signaling server env
+$env:TURN_URLS = "turn:<nas-host>:3478,turns:<nas-host>:5349"
+$env:TURN_SECRET = "<LONG_RANDOM_SECRET>"   # same as static-auth-secret
+$env:TURN_TTL_SEC = "3600"
+```
+
+The host logs `ICE: add-turn-server ... (added=true)` once it receives them. Verify
+end-to-end with [trickle-ice](https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/).
+
 ### 3. Client
 
 Either run the Electron app:
@@ -167,11 +195,14 @@ npm start              # UI: Signaling URL, Pairing Code, Connect
 - [x] **Robustness:** signaling auto-reconnect + keepalive; host stuck-key release on
       disconnect; per-monitor **DPI awareness**; client **jitter-buffer** latency tuning.
 
-### M1b — cross-NAT via TURN — **next (the remaining core gap)**
+### M1b — cross-NAT via TURN — **code wired; needs a coturn deployment**
 
-- [ ] Stand up **coturn** on a VPS / NAS; wire `turnUrl` / `turnUser` / `turnPass`.
-- [ ] Connect **across different NATs** with **no port forwarding**, including behind
-      Korean CGNAT, using the TURN relay. (Today: same-LAN or via Tailscale only.)
+- [x] Server mints **ephemeral** TURN credentials and pushes STUN+TURN to both peers
+      via `ice-servers`; host applies them to `webrtcbin` (`added=true` verified),
+      client passes them to `RTCPeerConnection`. See "TURN relay" above.
+- [ ] Stand up **coturn** on a NAS/VPS (`TURN_URLS` + `TURN_SECRET`) and confirm a real
+      cross-NAT / CGNAT connection with **no port forwarding**. (Today without coturn:
+      same-LAN or via Tailscale only.)
 
 ### Toward a sellable product — not yet started
 

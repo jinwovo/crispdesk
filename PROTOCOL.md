@@ -59,6 +59,7 @@ There are two protocols:
 | `peer-left`   | `role: "host" \| "client"`                                  | Sent to the OTHER peer when someone leaves. `role` is theirs.|
 | `error`       | `message: string`                                           | Bad pairing code / full room. Socket is then closed.        |
 | `code-assigned` | `code: string`, `expiresAt: int` (unix ms)                | **Dynamic pairing:** server → HOST after it joins; the host shows this code for a client to enter. |
+| `ice-servers`  | `iceServers: [{ urls: string[], username?: string, credential?: string }]` | Server → peer right after it joins. STUN + (when configured) TURN with **ephemeral** credentials. The host applies them to `webrtcbin` (`stun-server` / `add-turn-server`); the client passes them to `RTCPeerConnection`. |
 
 **Pairing (dynamic, default):** when a HOST joins, the server mints a random
 `CODE_LENGTH`-char code (unambiguous alphabet) with a TTL (`CODE_TTL_MS`, default

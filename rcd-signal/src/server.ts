@@ -29,7 +29,7 @@ import {
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomInt } from "node:crypto";
+import { randomInt, createHmac } from "node:crypto";
 
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 
@@ -54,6 +54,40 @@ const JOIN_WINDOW_MS = Number(process.env.JOIN_WINDOW_MS ?? 60_000);
 // Unambiguous alphabet (no 0/O/1/I/L) for human-typed codes.
 const CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const CODE_LENGTH = 6;
+
+// --- ICE / TURN -------------------------------------------------------------
+// The server issues TIME-LIMITED TURN credentials (coturn `use-auth-secret`
+// scheme) so neither peer ships a static TURN password. Configure:
+//   TURN_URLS=turn:nas.example.com:3478,turns:nas.example.com:5349
+//   TURN_SECRET=<the same static-auth-secret configured in coturn>
+//   TURN_TTL_SEC=3600
+// With those set, each joining peer is sent an `ice-servers` message carrying a
+// STUN entry plus a TURN entry whose username is `<expiry-unix>:rcd` and whose
+// credential is base64(HMAC-SHA1(TURN_SECRET, username)). Without them, peers
+// fall back to their own built-in STUN (LAN / Tailscale only).
+const STUN_URL = process.env.STUN_URL ?? "stun:stun.l.google.com:19302";
+const TURN_URLS = (process.env.TURN_URLS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const TURN_SECRET = process.env.TURN_SECRET ?? "";
+const TURN_TTL_SEC = Number(process.env.TURN_TTL_SEC ?? 3600);
+
+interface IceServerEntry {
+  urls: string[];
+  username?: string;
+  credential?: string;
+}
+
+/** Build the ICE server list for a peer, minting fresh ephemeral TURN credentials.
+ *  Returns null when no TURN is configured (peers then use their default STUN). */
+function makeIceServers(): IceServerEntry[] | null {
+  if (TURN_URLS.length === 0 || TURN_SECRET === "") return null;
+  const expiry = Math.floor(Date.now() / 1000) + TURN_TTL_SEC;
+  const username = `${expiry}:rcd`;
+  const credential = createHmac("sha1", TURN_SECRET).update(username).digest("base64");
+  return [{ urls: [STUN_URL] }, { urls: TURN_URLS, username, credential }];
+}
 
 // ---------------------------------------------------------------------------
 // Protocol message types
@@ -103,6 +137,12 @@ interface CodeAssignedMessage {
   expiresAt: number; // unix epoch ms
 }
 
+/** server -> peer: ICE servers (STUN + ephemeral-credential TURN) to use */
+interface IceServersMessage {
+  type: "ice-servers";
+  iceServers: IceServerEntry[];
+}
+
 /** host -> client (relayed verbatim) */
 interface OfferMessage {
   type: "offer";
@@ -136,6 +176,7 @@ type OutboundMessage =
   | PeerLeftMessage
   | ErrorMessage
   | CodeAssignedMessage
+  | IceServersMessage
   | RelayMessage;
 
 // ---------------------------------------------------------------------------
@@ -266,6 +307,11 @@ function commitJoin(
   const peerCount = set.size;
 
   send(ws, { type: "joined", role, peers: peerCount });
+  // Hand the peer its ICE servers (incl. fresh ephemeral TURN creds) up front, so
+  // it has them before the host begins negotiating. No-op if TURN isn't configured.
+  const ice = makeIceServers();
+  if (ice) send(ws, { type: "ice-servers", iceServers: ice });
+
   const other = otherPeerIn(room, ws);
   if (other) {
     send(other, { type: "peer-joined", role });
@@ -543,6 +589,11 @@ httpServer.listen(PORT, () => {
       `  dynamic pairing: each host is issued a ${CODE_LENGTH}-char code ` +
         `(TTL ${CODE_TTL_MS}ms, rate-limit ${JOIN_MAX_ATTEMPTS}/${JOIN_WINDOW_MS}ms)`,
     );
+  }
+  if (TURN_URLS.length > 0 && TURN_SECRET !== "") {
+    console.log(`  TURN: issuing ephemeral creds for ${TURN_URLS.join(", ")} (ttl ${TURN_TTL_SEC}s)`);
+  } else {
+    console.log(`  TURN: not configured (STUN only — LAN/Tailscale). Set TURN_URLS + TURN_SECRET.`);
   }
 });
 

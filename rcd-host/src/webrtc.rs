@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 
 use crate::pipeline;
 use crate::probe::Probed;
-use crate::signaling::{self, Role, SignalMessage};
+use crate::signaling::{self, IceServerCfg, Role, SignalMessage};
 
 /// Default STUN server (matches the client). Note webrtcbin wants the `stun://` scheme.
 const DEFAULT_STUN: &str = "stun://stun.l.google.com:19302";
@@ -100,6 +100,9 @@ pub async fn run() -> Result<()> {
     let mut session: Option<Session> = None;
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
     let mut backoff_secs = 1u64;
+    // Latest ICE servers from the signaling server (STUN + ephemeral TURN creds).
+    // The server sends these right after we join, before any negotiation.
+    let mut ice_servers: Vec<IceServerCfg> = Vec::new();
 
     // Outer RECONNECT loop: the host stays up and keeps re-joining the room across
     // signaling drops (e.g. a self-hosted server / NAS rebooting). Ctrl-C exits.
@@ -146,7 +149,7 @@ pub async fn run() -> Result<()> {
                         tracing::warn!("signaling connection lost; tearing down and reconnecting");
                         break; // inner break -> reconnect
                     };
-                    handle_signal(&mut session, &sig.outbound, &probed, msg);
+                    handle_signal(&mut session, &sig.outbound, &probed, &mut ice_servers, msg);
                 }
 
                 _ = abr_tick.tick() => {
@@ -197,11 +200,12 @@ fn start_session(
     session: &mut Option<Session>,
     signal_tx: &mpsc::UnboundedSender<SignalMessage>,
     probed: &Probed,
+    ice_servers: &[IceServerCfg],
 ) {
     // A previous session (e.g. the client refreshed the page) cannot be reused.
     teardown_session(session);
 
-    let (pipeline, state) = match build_pipeline(signal_tx.clone(), probed) {
+    let (pipeline, state) = match build_pipeline(signal_tx.clone(), probed, ice_servers) {
         Ok(ps) => ps,
         Err(e) => {
             tracing::error!("failed to build session pipeline: {e:?}");
@@ -266,6 +270,7 @@ fn handle_signal(
     session: &mut Option<Session>,
     signal_tx: &mpsc::UnboundedSender<SignalMessage>,
     probed: &Probed,
+    ice_servers: &mut Vec<IceServerCfg>,
     msg: SignalMessage,
 ) {
     match msg {
@@ -273,15 +278,21 @@ fn handle_signal(
         SignalMessage::Joined { role, peers } => {
             tracing::info!("joined room as {role:?}; peers in room = {peers}");
             if peers >= 2 {
-                start_session(session, signal_tx, probed);
+                start_session(session, signal_tx, probed, ice_servers);
             }
         }
         // The other peer joined (or rejoined after a refresh): start a fresh session.
         SignalMessage::PeerJoined { role } => {
             tracing::info!("peer joined: {role:?}");
             if role == Role::Client {
-                start_session(session, signal_tx, probed);
+                start_session(session, signal_tx, probed, ice_servers);
             }
+        }
+        // The signaling server handed us ICE servers (STUN + ephemeral TURN). Store
+        // them; the next session build applies them to webrtcbin.
+        SignalMessage::IceServers { ice_servers: ice } => {
+            tracing::info!("received {} ICE server entr(ies) from signaling", ice.len());
+            *ice_servers = ice;
         }
         SignalMessage::PeerLeft { role } => {
             tracing::warn!("peer left: {role:?}");
@@ -339,6 +350,7 @@ fn handle_signal(
 fn build_pipeline(
     signal_tx: mpsc::UnboundedSender<SignalMessage>,
     probed: &Probed,
+    ice_servers: &[IceServerCfg],
 ) -> Result<(gst::Pipeline, Arc<AppState>)> {
     // The capture/encode/parse/pay chain is defined in pipeline.rs so preview and stream
     // share one source-of-truth. It ends by feeding into our `webrtcbin`.
@@ -397,9 +409,12 @@ fn build_pipeline(
     if let Ok(turn) = std::env::var("TURN") {
         if !turn.is_empty() {
             let added: bool = webrtcbin.emit_by_name("add-turn-server", &[&turn]);
-            tracing::info!("TURN server '{turn}' added: {added}");
+            tracing::info!("TURN server (env) added: {added}");
         }
     }
+
+    // Server-provided ICE servers (STUN + ephemeral-credential TURN), if any.
+    apply_ice_servers(&webrtcbin, ice_servers);
 
     // --- Connection-state visibility (black-screen debugging) ---
     webrtcbin.connect_notify(Some("ice-connection-state"), |wb, _| {
@@ -588,6 +603,59 @@ fn apply_answer(state: &Arc<AppState>, sdp: &str) -> Result<()> {
         .emit_by_name::<()>("set-remote-description", &[&answer, &None::<gst::Promise>]);
     tracing::info!("Applied remote answer");
     Ok(())
+}
+
+/// Apply server-issued ICE servers to webrtcbin: STUN via the `stun-server` property,
+/// TURN via `add-turn-server`. This is what makes cross-NAT/CGNAT work (M1b) once a
+/// coturn relay is configured on the signaling server.
+fn apply_ice_servers(webrtcbin: &gst::Element, ice_servers: &[IceServerCfg]) {
+    for srv in ice_servers {
+        for url in &srv.urls {
+            if let Some(host) = url.strip_prefix("stun:") {
+                let uri = format!("stun://{host}");
+                webrtcbin.set_property("stun-server", &uri);
+                tracing::info!("ICE: stun-server = {uri}");
+            } else if url.starts_with("turn:") || url.starts_with("turns:") {
+                match (&srv.username, &srv.credential) {
+                    (Some(user), Some(cred)) => {
+                        let uri = to_webrtc_turn_uri(url, user, cred);
+                        let added: bool = webrtcbin.emit_by_name("add-turn-server", &[&uri]);
+                        tracing::info!("ICE: add-turn-server {url} (added={added})");
+                    }
+                    _ => tracing::warn!("TURN url {url} without credentials; skipping"),
+                }
+            } else {
+                tracing::warn!("ignoring unrecognized ICE url: {url}");
+            }
+        }
+    }
+}
+
+/// Rewrite a WebRTC `turn:host:port[?transport=...]` (or `turns:`) URL + credentials into
+/// the `turn(s)://user:pass@host:port[?...]` form webrtcbin expects, percent-encoding the
+/// user/pass (the coturn ephemeral username contains ':' and the base64 credential
+/// contains '+', '/', '=', all reserved in a URI authority).
+fn to_webrtc_turn_uri(url: &str, user: &str, cred: &str) -> String {
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("turns:") {
+        ("turns", r)
+    } else {
+        ("turn", url.strip_prefix("turn:").unwrap_or(url))
+    };
+    format!("{scheme}://{}:{}@{rest}", pct(user), pct(cred))
+}
+
+/// Percent-encode everything but URI unreserved characters.
+fn pct(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Wire the DataChannel handlers: decode input opcodes and inject them.

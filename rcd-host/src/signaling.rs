@@ -28,6 +28,17 @@ pub enum Role {
     Client,
 }
 
+/// One ICE server entry from the signaling server's `ice-servers` message
+/// (STUN has no creds; TURN carries ephemeral username/credential).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IceServerCfg {
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub credential: Option<String>,
+}
+
 /// Every protocol message tagged by its `"type"` field.
 ///
 /// `#[serde(tag = "type", rename_all = "kebab-case")]` makes the variant name the value
@@ -73,6 +84,14 @@ pub enum SignalMessage {
         code: String,
         #[serde(rename = "expiresAt")]
         expires_at: u64,
+    },
+
+    /// server -> peer: ICE servers (STUN + ephemeral-credential TURN) to use for
+    /// this session. Applied to webrtcbin before negotiation.
+    #[serde(rename = "ice-servers")]
+    IceServers {
+        #[serde(rename = "iceServers")]
+        ice_servers: Vec<IceServerCfg>,
     },
 
     /// host -> client (relayed): the SDP offer (full SDP string).

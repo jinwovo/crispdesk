@@ -55,6 +55,10 @@ interface IceMsg {
   sdpMid: string | null;
   sdpMLineIndex: number | null;
 }
+interface IceServersMsg {
+  type: "ice-servers";
+  iceServers: RTCIceServer[];
+}
 
 type ServerMsg =
   | JoinedMsg
@@ -63,7 +67,8 @@ type ServerMsg =
   | ErrorMsg
   | OfferMsg
   | AnswerMsg
-  | IceMsg;
+  | IceMsg
+  | IceServersMsg;
 
 // ---------------------------------------------------------------------------
 // Input DataChannel wire format (must match rcd-host's decoder EXACTLY).
@@ -239,6 +244,8 @@ class ClientConnection {
   private clipboardTimer: ReturnType<typeof setInterval> | null = null;
   /** Last clipboard text synced in EITHER direction (echo-loop guard). */
   private lastClipboard: string | null = null;
+  /** ICE servers from the signaling server (STUN + ephemeral TURN); null = defaults. */
+  private iceServers: RTCIceServer[] | null = null;
 
   // mousemove -> rAF throttle state. We coalesce moves to at most one send per
   // animation frame to avoid flooding the unreliable DataChannel.
@@ -349,6 +356,13 @@ class ClientConnection {
         await this.handleRemoteIce(msg);
         break;
 
+      case "ice-servers":
+        // Server handed us STUN + ephemeral TURN creds. Use them when we create the
+        // peer connection (arrives before the host's offer).
+        this.iceServers = msg.iceServers;
+        console.log("[rcd] received ICE servers from signaling", msg.iceServers.length);
+        break;
+
       default: {
         // Exhaustiveness guard.
         const _never: never = msg;
@@ -361,7 +375,11 @@ class ClientConnection {
   private ensurePeerConnection(): RTCPeerConnection {
     if (this.pc) return this.pc;
 
-    const pc = new RTCPeerConnection({ iceServers: buildIceServers() });
+    // Prefer the signaling server's ICE servers (incl. TURN relay creds) when present;
+    // otherwise fall back to the built-in STUN-only list (LAN / Tailscale).
+    const pc = new RTCPeerConnection({
+      iceServers: this.iceServers ?? buildIceServers(),
+    });
     this.pc = pc;
 
     // Trickle our local ICE candidates to the host.
