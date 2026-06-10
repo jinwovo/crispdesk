@@ -8,7 +8,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "tsc && node dist/server.js"
+    "dev": "tsc && node dist/server.js",
+    "test": "tsc && node --test \"test/**/*.test.mjs\""
   },
   "dependencies": {
     "ws": "^8.18.0"

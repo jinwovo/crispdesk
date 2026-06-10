@@ -658,6 +658,32 @@ fn pct(s: &str) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{pct, to_webrtc_turn_uri};
+
+    #[test]
+    fn pct_encodes_reserved_keeps_unreserved() {
+        // The ':' in the coturn username and '+','/','=' in the base64 credential
+        // must be percent-encoded; unreserved chars pass through unchanged.
+        assert_eq!(pct("1700000000:rcd"), "1700000000%3Arcd");
+        assert_eq!(pct("ab+/=cd"), "ab%2B%2F%3Dcd");
+        assert_eq!(pct("Aa0-_.~"), "Aa0-_.~");
+    }
+
+    #[test]
+    fn turn_uri_embeds_encoded_credentials() {
+        assert_eq!(
+            to_webrtc_turn_uri("turn:nas:3478", "1700:rcd", "x+/="),
+            "turn://1700%3Arcd:x%2B%2F%3D@nas:3478"
+        );
+        assert_eq!(
+            to_webrtc_turn_uri("turns:nas:5349", "u", "p"),
+            "turns://u:p@nas:5349"
+        );
+    }
+}
+
 /// Wire the DataChannel handlers: decode input opcodes and inject them.
 ///
 /// We connect both "on-message-data" (binary; this is what the client sends) and

@@ -61,15 +61,22 @@ fn scaled_dims() -> Option<(u32, u32)> {
     let cap = res_cap()?; // None => native, no scaling
     // Use the SELECTED monitor's size (multi-monitor) else the primary. This keeps the
     // encode aspect ratio matched to whichever display is actually being captured.
-    let (sw, sh) = match crate::monitors::selected() {
+    let src = match crate::monitors::selected() {
         Some(m) => (m.width.max(1) as u32, m.height.max(1) as u32),
         None => crate::input::primary_resolution().unwrap_or(cap),
     };
+    Some(fit_within(src, cap))
+}
+
+/// Fit `src` within `cap` preserving aspect ratio, never upscaling, with even dims
+/// (H.264 requires even width/height). Pure, so it's unit-tested.
+fn fit_within(src: (u32, u32), cap: (u32, u32)) -> (u32, u32) {
+    let (sw, sh) = (src.0.max(1), src.1.max(1));
     let scale = (cap.0 as f64 / sw as f64)
         .min(cap.1 as f64 / sh as f64)
         .min(1.0); // never upscale
     let even = |v: f64| ((v.round() as u32) & !1).max(2);
-    Some((even(sw as f64 * scale), even(sh as f64 * scale)))
+    (even(sw as f64 * scale), even(sh as f64 * scale))
 }
 
 /// The capture source description with the selected monitor pinned, when applicable.
@@ -227,4 +234,23 @@ pub fn run_preview(probed: &Probed) -> Result<()> {
         .context("failed to set preview pipeline to NULL")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_within;
+
+    #[test]
+    fn fit_preserves_aspect_no_upscale_even_dims() {
+        // 3:2 desktop into a 1080p cap -> 1620x1080 (height-bound), no letterbox.
+        assert_eq!(fit_within((2880, 1920), (1920, 1080)), (1620, 1080));
+        // Already within the cap -> unchanged (never upscale).
+        assert_eq!(fit_within((1280, 720), (1920, 1080)), (1280, 720));
+        // Exact 16:9 fills the cap.
+        assert_eq!(fit_within((1920, 1080), (1920, 1080)), (1920, 1080));
+        // Odd inputs round to even dimensions.
+        let (w, h) = fit_within((1001, 667), (1920, 1080));
+        assert_eq!(w % 2, 0);
+        assert_eq!(h % 2, 0);
+    }
 }

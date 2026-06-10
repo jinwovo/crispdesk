@@ -248,7 +248,16 @@ pub fn probe_encoder() -> Result<EncoderChoice> {
         }
     }
 
+    // x264enc is GPL: linking/shipping it in a PROPRIETARY product is a copyleft
+    // landmine. It is excluded from auto-selection unless ALLOW_GPL=1 (open-source
+    // builds, or local dev). The explicit `ENCODER=x264enc` override above still works.
+    let allow_gpl = std::env::var("ALLOW_GPL").as_deref() == Ok("1");
+
     for cand in encoder_ladder() {
+        if cand.element == "x264enc" && !allow_gpl {
+            tracing::debug!("skipping GPL 'x264enc' (set ALLOW_GPL=1 to allow it)");
+            continue;
+        }
         if !factory_present(&cand.element) {
             tracing::debug!("encoder '{}' not registered; skipping", cand.element);
             continue;
@@ -264,9 +273,9 @@ pub fn probe_encoder() -> Result<EncoderChoice> {
     }
 
     Err(anyhow!(
-        "no working H.264 encoder found — not even the software fallback. \
-         Is the GStreamer plugin set complete (openh264/x264, libav)? \
-         Try `gst-inspect-1.0 openh264enc`."
+        "no working H.264 encoder found. The license-clean fallback is openh264enc; \
+         the GPL x264enc is excluded unless ALLOW_GPL=1. Is the GStreamer plugin set \
+         complete (openh264, libav, the vendor HW plugins)? Try `gst-inspect-1.0 openh264enc`."
     ))
 }
 

@@ -92,24 +92,24 @@ fn set_from_remote(text: &str) {
 
 /// Decode + apply an inbound CLIPBOARD_TEXT frame (called from the DataChannel handler).
 pub fn handle_incoming(data: &[u8]) {
-    if data.first() != Some(&OPCODE_CLIPBOARD_TEXT) {
-        tracing::warn!("clipboard channel: unexpected opcode {:?}", data.first());
-        return;
+    match decode_frame(data) {
+        Some(text) => set_from_remote(text),
+        None => tracing::warn!("clipboard: malformed/invalid frame ({} bytes)", data.len()),
     }
-    if data.len() < 5 {
-        tracing::warn!("clipboard frame too short: {} bytes", data.len());
-        return;
+}
+
+/// Parse a CLIPBOARD_TEXT frame `[0x06][u32 len LE][utf8]` into its text, or None if
+/// the opcode is wrong, the header is short, the body is truncated, or it isn't UTF-8.
+fn decode_frame(data: &[u8]) -> Option<&str> {
+    if data.first() != Some(&OPCODE_CLIPBOARD_TEXT) || data.len() < 5 {
+        return None;
     }
     let len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
-    let end = 5usize.saturating_add(len);
+    let end = 5usize.checked_add(len)?;
     if data.len() < end {
-        tracing::warn!("clipboard frame truncated: need {end} bytes, got {}", data.len());
-        return;
+        return None;
     }
-    match std::str::from_utf8(&data[5..end]) {
-        Ok(text) => set_from_remote(text),
-        Err(e) => tracing::warn!("clipboard text not valid UTF-8: {e}"),
-    }
+    std::str::from_utf8(&data[5..end]).ok()
 }
 
 /// Encode a CLIPBOARD_TEXT frame.
@@ -167,4 +167,27 @@ pub fn start_poller() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_frame, encode, OPCODE_CLIPBOARD_TEXT};
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let big = "x".repeat(5000);
+        for s in ["", "hello", "한글 🎉 émoji\nline2", big.as_str()] {
+            let frame = encode(s);
+            assert_eq!(frame[0], OPCODE_CLIPBOARD_TEXT);
+            assert_eq!(decode_frame(&frame), Some(s));
+        }
+    }
+
+    #[test]
+    fn decode_rejects_malformed() {
+        assert_eq!(decode_frame(&[]), None); // empty
+        assert_eq!(decode_frame(&[0x06, 0, 0]), None); // header too short
+        assert_eq!(decode_frame(&[0x01, 0, 0, 0, 0]), None); // wrong opcode
+        assert_eq!(decode_frame(&[0x06, 10, 0, 0, 0, b'a', b'b']), None); // truncated body
+    }
 }

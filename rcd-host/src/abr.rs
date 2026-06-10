@@ -90,12 +90,7 @@ impl AbrState {
         let frac = d_lost as f64 / (d_sent + d_lost) as f64;
 
         let before = self.target_kbps;
-        if frac > 0.05 {
-            self.target_kbps = ((self.target_kbps as f64) * 0.85) as u32;
-        } else if frac < 0.02 {
-            self.target_kbps += 500;
-        }
-        self.target_kbps = self.target_kbps.clamp(self.min_kbps, self.max_kbps);
+        self.target_kbps = aimd_step(self.target_kbps, frac, self.min_kbps, self.max_kbps);
 
         if self.target_kbps != before {
             set_encoder_bitrate(venc, &self.enc_name, self.target_kbps);
@@ -148,6 +143,19 @@ fn read_loss(webrtcbin: &gst::Element) -> Option<(u64, i64, f64)> {
     }
 }
 
+/// One AIMD step: multiplicative decrease (×0.85) above 5% loss, additive increase
+/// (+500) below 2%, hold in between — clamped to `[min, max]`. Pure, so it's unit-tested.
+fn aimd_step(target: u32, loss_frac: f64, min: u32, max: u32) -> u32 {
+    let next = if loss_frac > 0.05 {
+        ((target as f64) * 0.85) as u32
+    } else if loss_frac < 0.02 {
+        target + 500
+    } else {
+        target
+    };
+    next.clamp(min, max)
+}
+
 /// Set the encoder bitrate live. The property is named "bitrate" on every encoder in
 /// our ladder, but the UNIT differs: openh264enc is bits/s; the rest are kbit/s.
 fn set_encoder_bitrate(venc: &gst::Element, enc_name: &str, kbps: u32) {
@@ -157,4 +165,22 @@ fn set_encoder_bitrate(venc: &gst::Element, enc_name: &str, kbps: u32) {
         kbps // kbit/s (mf/nv/qsv/amf/x264)
     };
     venc.set_property("bitrate", value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aimd_step;
+
+    #[test]
+    fn aimd_decrease_increase_hold_and_clamp() {
+        // > 5% loss -> ×0.85 (multiplicative decrease)
+        assert_eq!(aimd_step(10_000, 0.10, 1500, 12_000), 8500);
+        // < 2% loss -> +500 (additive increase)
+        assert_eq!(aimd_step(8000, 0.0, 1500, 12_000), 8500);
+        // 2%..5% -> hold
+        assert_eq!(aimd_step(8000, 0.03, 1500, 12_000), 8000);
+        // clamps to the ceiling and the floor
+        assert_eq!(aimd_step(11_800, 0.0, 1500, 12_000), 12_000);
+        assert_eq!(aimd_step(1600, 0.5, 1500, 12_000), 1500);
+    }
 }

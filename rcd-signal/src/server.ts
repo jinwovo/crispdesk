@@ -29,7 +29,14 @@ import {
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomInt, createHmac } from "node:crypto";
+import { randomInt } from "node:crypto";
+
+import {
+  CODE_ALPHABET,
+  generatePairingCode,
+  turnCredentials,
+  rateLimitCheck,
+} from "./pairing.js";
 
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 
@@ -51,9 +58,12 @@ const CODE_TTL_MS = Number(process.env.CODE_TTL_MS ?? 300_000); // 5 min
 // Per-IP client-join rate limit (brute-force defence on short codes).
 const JOIN_MAX_ATTEMPTS = Number(process.env.JOIN_MAX_ATTEMPTS ?? 10);
 const JOIN_WINDOW_MS = Number(process.env.JOIN_WINDOW_MS ?? 60_000);
-// Unambiguous alphabet (no 0/O/1/I/L) for human-typed codes.
-const CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
-const CODE_LENGTH = 6;
+// 8 chars over the 31-symbol CODE_ALPHABET ≈ 40 bits of entropy — combined with the
+// per-IP rate limit, far harder to brute-force than the old 6 (~29 bits). Override env.
+const CODE_LENGTH = Number(process.env.CODE_LENGTH ?? 8);
+// In production, the unauthenticated browser test client (GET /) should be OFF so a
+// LAN device can't reach the control surface. Set DISABLE_TEST_PAGE=true to gate it.
+const DISABLE_TEST_PAGE = process.env.DISABLE_TEST_PAGE === "true";
 
 // --- ICE / TURN -------------------------------------------------------------
 // The server issues TIME-LIMITED TURN credentials (coturn `use-auth-secret`
@@ -83,9 +93,11 @@ interface IceServerEntry {
  *  Returns null when no TURN is configured (peers then use their default STUN). */
 function makeIceServers(): IceServerEntry[] | null {
   if (TURN_URLS.length === 0 || TURN_SECRET === "") return null;
-  const expiry = Math.floor(Date.now() / 1000) + TURN_TTL_SEC;
-  const username = `${expiry}:rcd`;
-  const credential = createHmac("sha1", TURN_SECRET).update(username).digest("base64");
+  const { username, credential } = turnCredentials(
+    TURN_SECRET,
+    TURN_TTL_SEC,
+    Math.floor(Date.now() / 1000),
+  );
   return [{ urls: [STUN_URL] }, { urls: TURN_URLS, username, credential }];
 }
 
@@ -214,10 +226,7 @@ const ipAttempts = new Map<string, number[]>();
 /** Mint a fresh code not currently active or in use as a room. */
 function mintCode(): string {
   for (let tries = 0; tries < 50; tries++) {
-    let code = "";
-    for (let i = 0; i < CODE_LENGTH; i++) {
-      code += CODE_ALPHABET[randomInt(CODE_ALPHABET.length)];
-    }
+    const code = generatePairingCode(CODE_LENGTH, (max) => randomInt(max));
     if (!codeExpiry.has(code) && !rooms.has(code)) return code;
   }
   // Astronomically unlikely; widen with a timestamp suffix as a last resort.
@@ -234,11 +243,14 @@ function pruneExpiredCodes(): void {
 
 /** Record a client-join attempt for `ip`; return false if over the rate limit. */
 function allowJoinAttempt(ip: string): boolean {
-  const now = Date.now();
-  const recent = (ipAttempts.get(ip) ?? []).filter((t) => now - t < JOIN_WINDOW_MS);
-  recent.push(now);
+  const { allowed, recent } = rateLimitCheck(
+    ipAttempts.get(ip) ?? [],
+    Date.now(),
+    JOIN_WINDOW_MS,
+    JOIN_MAX_ATTEMPTS,
+  );
   ipAttempts.set(ip, recent);
-  return recent.length <= JOIN_MAX_ATTEMPTS;
+  return allowed;
 }
 
 // ---------------------------------------------------------------------------
@@ -531,6 +543,14 @@ const TEST_PAGE = `<!DOCTYPE html>
 
 function handleHttp(req: IncomingMessage, res: ServerResponse): void {
   const u = (req.url ?? "/").split("?")[0];
+
+  // Production hardening: the browser test client is unauthenticated, so it can be
+  // disabled entirely (the native Electron client connects over /ws regardless).
+  if (DISABLE_TEST_PAGE && (u === "/" || u === "/index.html" || u === "/renderer.js")) {
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+    res.end("not found");
+    return;
+  }
 
   if (req.method === "GET" && (u === "/" || u === "/index.html")) {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });

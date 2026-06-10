@@ -119,6 +119,7 @@ Useful host env vars:
 | `AUDIO`      | on                       | `AUDIO=0` disables system-audio capture.                  |
 | `CLIPBOARD`  | on                       | `CLIPBOARD=0` disables clipboard sync.                    |
 | `ENCODER`    | (auto-probe)             | Force an encoder, e.g. `x264enc`.                         |
+| `ALLOW_GPL`  | off                      | `ALLOW_GPL=1` lets the probe auto-select the **GPL** `x264enc` (excluded by default for proprietary builds; license-clean `openh264enc` is the software fallback). |
 | `CAPTURE`    | (auto-probe)             | Force a capture source.                                   |
 | `RTP_MTU`    | `1200`                   | RTP packet size — **leave at 1200** (see PROTOCOL.md).    |
 | `SIGNAL_URL` | `ws://127.0.0.1:8080/ws` | Signaling server URL.                                     |
@@ -171,6 +172,19 @@ npm start              # UI: Signaling URL, Pairing Code, Connect
 
 ---
 
+## Testing & CI
+
+```powershell
+cd rcd-signal; npm test                 # pairing-code / TURN-credential / rate-limit unit tests
+cd rcd-host;   cargo test                # clipboard codec, ABR AIMD, TURN URI, aspect-fit math
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) builds + tests all three components on
+every push/PR: the Node side on Ubuntu, the Rust host on a native ARM64 Windows
+runner with GStreamer installed.
+
+---
+
 ## Milestone plan
 
 ### M1a — local end-to-end loop (LAN / STUN) — ✅ done
@@ -204,13 +218,18 @@ npm start              # UI: Signaling URL, Pairing Code, Connect
       cross-NAT / CGNAT connection with **no port forwarding**. (Today without coturn:
       same-LAN or via Tailscale only.)
 
-### Toward a sellable product — not yet started
+### Toward a sellable product
 
+- [x] **License-clean default**: GPL `x264enc` excluded from auto-selection unless
+      `ALLOW_GPL=1`; `openh264enc` is the software fallback. (H.264 MPEG-LA royalty
+      strategy still TBD.)
+- [x] **Auth hardening (partial)**: 8-char (~40-bit) pairing code, per-IP rate limit,
+      `DISABLE_TEST_PAGE` to gate the unauthenticated browser client.
+- [x] **Automated tests + CI** foundation (see Testing above).
 - [ ] Signed installers (Windows code-sign, macOS notarize) + auto-update.
 - [ ] Host as a **Windows service** (control the UAC/secure desktop, run on boot).
-- [ ] Account/identity + consent UI; **wss/TLS** signaling; config UI (no env vars).
-- [ ] Replace GPL `x264enc` for proprietary distribution; address H.264 royalties.
-- [ ] Automated tests + CI; file transfer; client-driven monitor switching.
+- [ ] Account/identity + connection consent dialog; **wss/TLS** signaling; config UI.
+- [ ] File transfer; client-driven monitor switching; macOS host.
 
 ---
 
