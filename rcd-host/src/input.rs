@@ -41,6 +41,75 @@ static HELD_KEYS: LazyLock<Mutex<HashSet<(u16, bool)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static HELD_BUTTONS: LazyLock<Mutex<HashSet<u8>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
+// Whether injected input is currently permitted. Defaults to true (unchanged
+// behaviour); with REQUIRE_CONSENT the session starts with this false until the local
+// user clicks "Yes" on the consent dialog (see request_consent).
+static INPUT_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+// Bumped on every consent request so a stale dialog from a PREVIOUS session can't
+// grant input to a NEW one (the dialog thread checks its captured generation).
+static CONSENT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether decoded input should be injected (gated by the consent dialog).
+pub fn input_allowed() -> bool {
+    INPUT_ALLOWED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the input-allowed gate (called when a session starts / consent resolves).
+pub fn set_input_allowed(v: bool) {
+    INPUT_ALLOWED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Block input and show a modal Yes/No consent dialog on a background thread; input is
+/// enabled only if the local user clicks Yes. Used when REQUIRE_CONSENT=1 so a remote
+/// peer can't control the machine without the seated user's explicit, per-session OK.
+///
+/// Each call captures a fresh CONSENT_GEN; a late "Yes" on a dialog whose session has
+/// already ended (a newer request_consent ran) is IGNORED, so a stale prompt can't
+/// grant control to a different peer. Note: combined with LOCK_ON_DISCONNECT the next
+/// session's dialog appears only after the user unlocks — which is safe (input stays
+/// blocked until a present user approves), just requires the user at the machine.
+pub fn request_consent() {
+    use std::sync::atomic::Ordering;
+    let generation = CONSENT_GEN.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    set_input_allowed(false);
+    std::thread::spawn(move || {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, IDYES, MB_ICONWARNING, MB_SYSTEMMODAL, MB_YESNO,
+        };
+        // SAFETY: a plain Win32 call with string literals that live for the call.
+        let result = unsafe {
+            MessageBoxW(
+                None,
+                windows::core::w!("Allow remote control of this PC for this session?"),
+                windows::core::w!("crispdesk — incoming connection"),
+                MB_YESNO | MB_ICONWARNING | MB_SYSTEMMODAL,
+            )
+        };
+        if result != IDYES {
+            tracing::warn!("consent denied -> input stays blocked");
+        } else if CONSENT_GEN.load(Ordering::SeqCst) == generation {
+            set_input_allowed(true);
+            tracing::info!("consent granted -> input enabled");
+        } else {
+            tracing::warn!("consent granted but a newer session superseded it; ignoring");
+        }
+    });
+}
+
+/// Lock the workstation (sign-out-style lock screen). Used for LOCK_ON_DISCONNECT so
+/// the desktop isn't left unlocked after a remote session ends.
+pub fn lock_workstation() {
+    use windows::Win32::System::Shutdown::LockWorkStation;
+    // SAFETY: plain Win32 call.
+    unsafe {
+        if let Err(e) = LockWorkStation() {
+            tracing::warn!("LockWorkStation failed: {e}");
+        }
+    }
+    tracing::info!("workstation locked (LOCK_ON_DISCONNECT)");
+}
+
 /// Inject a single INPUT event, logging (not failing) on rejection.
 fn send_one(input: INPUT) {
     // SAFETY: SendInput is a plain Win32 FFI call; the INPUT array lives on the stack

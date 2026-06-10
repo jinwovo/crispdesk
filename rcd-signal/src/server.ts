@@ -22,11 +22,14 @@
  */
 
 import {
-  createServer,
+  createServer as createHttpServer,
   type IncomingMessage,
   type ServerResponse,
+  type Server as HttpServer,
 } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import { readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomInt } from "node:crypto";
@@ -36,6 +39,8 @@ import {
   generatePairingCode,
   turnCredentials,
   rateLimitCheck,
+  isOriginAllowed,
+  parseAllowedOrigins,
 } from "./pairing.js";
 
 import { WebSocketServer, WebSocket, type RawData } from "ws";
@@ -82,6 +87,26 @@ const TURN_URLS = (process.env.TURN_URLS ?? "")
   .filter(Boolean);
 const TURN_SECRET = process.env.TURN_SECRET ?? "";
 const TURN_TTL_SEC = Number(process.env.TURN_TTL_SEC ?? 3600);
+
+// --- Transport hardening -----------------------------------------------------
+// Optional wss/TLS: when BOTH TLS_CERT and TLS_KEY (PEM file paths) are set, the
+// HTTP server is created with node:https and serves wss://. If either is unset,
+// or the files can't be read, we fall back to plain ws:// (logged clearly). We do
+// NOT generate certs — the integrator supplies them.
+const TLS_CERT = process.env.TLS_CERT ?? "";
+const TLS_KEY = process.env.TLS_KEY ?? "";
+
+// Reject WebSocket frames larger than this (bytes). SDP is a few KB and the host
+// caps clipboard payloads, so 256 KiB is comfortably above any legitimate frame
+// while bounding memory a hostile peer can force us to buffer. Override via
+// WS_MAX_PAYLOAD (bytes).
+const WS_MAX_PAYLOAD = Number(process.env.WS_MAX_PAYLOAD ?? 256 * 1024);
+
+// Optional Origin allowlist for WS upgrades. When ALLOWED_ORIGINS is set
+// (comma-separated), browser upgrades whose Origin is not listed are rejected
+// with close code 1008. Unset => allow all (unchanged). Native clients (the Rust
+// host) send no Origin and are always allowed — see isOriginAllowed().
+const ALLOWED_ORIGINS = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
 
 interface IceServerEntry {
   urls: string[];
@@ -577,8 +602,54 @@ function handleHttp(req: IncomingMessage, res: ServerResponse): void {
   res.end("not found");
 }
 
-const httpServer = createServer(handleHttp);
-const wss = new WebSocketServer({ server: httpServer, path: WS_PATH });
+/**
+ * Build the underlying HTTP(S) server. Returns the server plus a flag indicating
+ * whether TLS is active (purely for logging). When TLS_CERT and TLS_KEY are BOTH
+ * set we attempt https; any read/parse failure falls back to plain http with a
+ * clear error so a misconfigured cert never takes the signaling server down.
+ */
+function buildServer(): { server: HttpServer; tls: boolean } {
+  if (TLS_CERT !== "" && TLS_KEY !== "") {
+    try {
+      const cert = readFileSync(TLS_CERT);
+      const key = readFileSync(TLS_KEY);
+      // node:https Server is API-compatible with node:http Server for our use
+      // (handleHttp, .listen, .on('error'), ws upgrade), so the cast is safe.
+      const server = createHttpsServer({ cert, key }, handleHttp) as unknown as HttpServer;
+      console.log(`[tls] enabled — serving wss:// (cert=${TLS_CERT})`);
+      return { server, tls: true };
+    } catch (err) {
+      console.error(
+        `[tls] FAILED to read cert/key (cert=${TLS_CERT}, key=${TLS_KEY}); ` +
+          `falling back to plain ws://:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  } else {
+    console.log("[tls] disabled (TLS_CERT/TLS_KEY not both set) — serving ws://");
+  }
+  return { server: createHttpServer(handleHttp), tls: false };
+}
+
+const { server: httpServer, tls: tlsEnabled } = buildServer();
+const wss = new WebSocketServer({
+  server: httpServer,
+  path: WS_PATH,
+  // Reject oversized frames at the protocol layer (defence against memory abuse).
+  maxPayload: WS_MAX_PAYLOAD,
+  // Origin allowlist (no-op when ALLOWED_ORIGINS is empty). Runs during the WS
+  // handshake; rejecting here prevents the connection from ever opening.
+  verifyClient: (info, done) => {
+    const origin = info.req.headers.origin;
+    if (isOriginAllowed(origin, ALLOWED_ORIGINS)) {
+      done(true);
+      return;
+    }
+    console.warn(`[origin] rejected WS upgrade from disallowed origin '${origin ?? ""}'`);
+    // 1008 = policy violation. The handshake is refused with an HTTP error.
+    done(false, 1008, "origin not allowed");
+  },
+});
 
 wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
   const ip = req.socket.remoteAddress ?? "unknown";
@@ -600,8 +671,16 @@ httpServer.on("error", (err) => {
 });
 
 httpServer.listen(PORT, () => {
-  console.log(`rcd-signal listening on ws://0.0.0.0:${PORT}${WS_PATH}`);
-  console.log(`  browser test client: http://<this-machine-ip>:${PORT}/`);
+  const wsScheme = tlsEnabled ? "wss" : "ws";
+  const httpScheme = tlsEnabled ? "https" : "http";
+  console.log(`rcd-signal listening on ${wsScheme}://0.0.0.0:${PORT}${WS_PATH}`);
+  console.log(`  browser test client: ${httpScheme}://<this-machine-ip>:${PORT}/`);
+  console.log(`  WS max payload: ${WS_MAX_PAYLOAD} bytes`);
+  if (ALLOWED_ORIGINS.length > 0) {
+    console.log(`  Origin allowlist: ${ALLOWED_ORIGINS.join(", ")}`);
+  } else {
+    console.log(`  Origin allowlist: (none — all origins allowed)`);
+  }
   if (DEV_MODE) {
     console.log(`  DEV_MODE on: fixed PAIRING_CODE = "${PAIRING_CODE}"`);
   } else {

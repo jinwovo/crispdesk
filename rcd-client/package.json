@@ -5,12 +5,38 @@
   "private": true,
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsc -p tsconfig.main.json && tsc -p tsconfig.renderer.json",
-    "start": "npm run build && electron ."
+    "build": "tsc -p tsconfig.main.json && tsc -p tsconfig.renderer.json && node scripts/mark-esm.mjs",
+    "start": "npm run build && electron .",
+    "pretest": "npm run build",
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.crispdesk.client",
+    "productName": "crispdesk",
+    "files": [
+      "dist/**/*",
+      "index.html"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        "dmg"
+      ]
+    }
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
     "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
     "typescript": "^5.5.0"
   }
 }

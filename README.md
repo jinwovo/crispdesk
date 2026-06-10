@@ -118,6 +118,9 @@ Useful host env vars:
 | `MONITOR`    | primary                  | Monitor index to capture + control (enumerated at startup).|
 | `AUDIO`      | on                       | `AUDIO=0` disables system-audio capture.                  |
 | `CLIPBOARD`  | on                       | `CLIPBOARD=0` disables clipboard sync.                    |
+| `REQUIRE_CONSENT` | off                 | `REQUIRE_CONSENT=1` blocks injected input + inbound clipboard until the seated user approves a per-session consent dialog. |
+| `LOCK_ON_DISCONNECT` | off              | `LOCK_ON_DISCONNECT=1` locks the workstation when the remote peer leaves. |
+| `AUDIT_LOG`  | `%LOCALAPPDATA%\crispdesk\audit.jsonl` | Session-event JSONL path; `AUDIT_LOG=off` disables. |
 | `ENCODER`    | (auto-probe)             | Force an encoder, e.g. `x264enc`.                         |
 | `ALLOW_GPL`  | off                      | `ALLOW_GPL=1` lets the probe auto-select the **GPL** `x264enc` (excluded by default for proprietary builds; license-clean `openh264enc` is the software fallback). |
 | `CAPTURE`    | (auto-probe)             | Force a capture source.                                   |
@@ -127,7 +130,11 @@ Useful host env vars:
 
 Signaling server env: `DEV_MODE=true` uses a fixed `PAIRING_CODE`; otherwise each
 host is issued a random code (`CODE_TTL_MS`, default 5 min) shown in the host log,
-with per-IP join rate-limiting (`JOIN_MAX_ATTEMPTS`/`JOIN_WINDOW_MS`).
+with per-IP join rate-limiting (`JOIN_MAX_ATTEMPTS`/`JOIN_WINDOW_MS`). Hardening:
+`TLS_CERT`+`TLS_KEY` (PEM paths) enable **wss://** (falls back to `ws://` if unset/
+unreadable); `WS_MAX_PAYLOAD` caps frame size (default 256 KiB); `ALLOWED_ORIGINS`
+(comma list) restricts browser WS upgrades; `DISABLE_TEST_PAGE=true` hides the
+unauthenticated browser client.
 
 ### TURN relay for cross-NAT (M1b — code wired, needs a coturn server)
 
@@ -175,8 +182,9 @@ npm start              # UI: Signaling URL, Pairing Code, Connect
 ## Testing & CI
 
 ```powershell
-cd rcd-signal; npm test                 # pairing-code / TURN-credential / rate-limit unit tests
-cd rcd-host;   cargo test                # clipboard codec, ABR AIMD, TURN URI, aspect-fit math
+cd rcd-signal; npm test    # pairing code / TURN credential / rate-limit / origin allowlist (9)
+cd rcd-client; npm test    # wire-format encoders/decoders, clipboard codec, button/scancode maps (18)
+cd rcd-host;   cargo test   # clipboard codec, ABR AIMD, TURN URI, aspect-fit math (6)
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) builds + tests all three components on
@@ -223,12 +231,15 @@ runner with GStreamer installed.
 - [x] **License-clean default**: GPL `x264enc` excluded from auto-selection unless
       `ALLOW_GPL=1`; `openh264enc` is the software fallback. (H.264 MPEG-LA royalty
       strategy still TBD.)
-- [x] **Auth hardening (partial)**: 8-char (~40-bit) pairing code, per-IP rate limit,
-      `DISABLE_TEST_PAGE` to gate the unauthenticated browser client.
-- [x] **Automated tests + CI** foundation (see Testing above).
-- [ ] Signed installers (Windows code-sign, macOS notarize) + auto-update.
+- [x] **Auth/transport hardening**: 8-char (~40-bit) pairing code, per-IP rate limit,
+      `DISABLE_TEST_PAGE`, **wss/TLS** (`TLS_CERT`/`TLS_KEY`), WS frame cap, Origin
+      allowlist; host-side **consent dialog** (`REQUIRE_CONSENT`), **audit log**, and
+      `LOCK_ON_DISCONNECT`.
+- [x] **Automated tests + CI** foundation (33 tests; see Testing above).
+- [x] **electron-builder** packaging config (`npm run dist` after installing it).
+- [ ] Code-signing cert + notarization + auto-update (needs a cert).
 - [ ] Host as a **Windows service** (control the UAC/secure desktop, run on boot).
-- [ ] Account/identity + connection consent dialog; **wss/TLS** signaling; config UI.
+- [ ] Account/identity (persistent), config UI; H.264 royalty strategy.
 - [ ] File transfer; client-driven monitor switching; macOS host.
 
 ---

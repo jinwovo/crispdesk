@@ -28,6 +28,7 @@
 //! ==========================================================================
 
 mod abr;
+mod audit;
 mod clipboard;
 mod input;
 mod monitors;

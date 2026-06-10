@@ -92,6 +92,11 @@ fn set_from_remote(text: &str) {
 
 /// Decode + apply an inbound CLIPBOARD_TEXT frame (called from the DataChannel handler).
 pub fn handle_incoming(data: &[u8]) {
+    // Consent gate: a non-consented peer must not alter the host clipboard either
+    // (same gate as injected input; see input::request_consent / REQUIRE_CONSENT).
+    if !crate::input::input_allowed() {
+        return;
+    }
     match decode_frame(data) {
         Some(text) => set_from_remote(text),
         None => tracing::warn!("clipboard: malformed/invalid frame ({} bytes)", data.len()),

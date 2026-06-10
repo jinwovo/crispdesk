@@ -41,3 +41,36 @@ export function rateLimitCheck(
   recent.push(nowMs);
   return { allowed: recent.length <= max, recent };
 }
+
+/**
+ * Origin allowlist decision for WS upgrades. `allowList` is the parsed set of
+ * permitted Origin header values (already trimmed; empty entries dropped).
+ *
+ * Policy:
+ *   - An EMPTY allowList means "no restriction" — allow everything (the default
+ *     when ALLOWED_ORIGINS is unset). This preserves existing behaviour.
+ *   - A non-empty allowList permits only an EXACT-match Origin. A missing/empty
+ *     Origin header (e.g. a non-browser client like the Rust host, which sends no
+ *     Origin) is allowed: the allowlist targets browser cross-origin abuse, not
+ *     native peers, and rejecting it would break the host.
+ *
+ * Pure and side-effect-free so it can be unit-tested in isolation.
+ */
+export function isOriginAllowed(
+  origin: string | undefined | null,
+  allowList: readonly string[],
+): boolean {
+  // No restriction configured -> allow all (unchanged default behaviour).
+  if (allowList.length === 0) return true;
+  // Non-browser clients (host) send no Origin header; do not block them.
+  if (origin === undefined || origin === null || origin === "") return true;
+  return allowList.includes(origin);
+}
+
+/** Parse a comma-separated ALLOWED_ORIGINS value into a trimmed, non-empty list. */
+export function parseAllowedOrigins(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}

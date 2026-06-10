@@ -191,6 +191,7 @@ fn teardown_session(session: &mut Option<Session>) {
         crate::input::release_all();
         // Drop the clipboard channel handle so the poller stops sending into a dead session.
         crate::clipboard::set_channel(None);
+        crate::audit::log_event("session_end", &[]);
         tracing::info!("session torn down");
     }
 }
@@ -251,6 +252,15 @@ fn start_session(
         return;
     }
 
+    // Consent gate: with REQUIRE_CONSENT=1 input stays blocked until the seated user
+    // approves the modal dialog; otherwise input is enabled immediately (unchanged).
+    if std::env::var("REQUIRE_CONSENT").as_deref() == Ok("1") {
+        crate::input::request_consent();
+    } else {
+        crate::input::set_input_allowed(true);
+    }
+    crate::audit::log_event("session_start", &[("encoder", &probed.encoder.element)]);
+
     // Adaptive bitrate retunes this session's encoder; grab it by the name set in
     // pipeline.rs ("venc"). Absent only if the pipeline shape changed.
     let venc = pipeline.by_name("venc");
@@ -297,6 +307,11 @@ fn handle_signal(
         SignalMessage::PeerLeft { role } => {
             tracing::warn!("peer left: {role:?}");
             teardown_session(session);
+            // Optionally lock the workstation so the desktop isn't left unlocked after
+            // a remote session ends (only on a real peer-leave, not a session rebuild).
+            if std::env::var("LOCK_ON_DISCONNECT").as_deref() == Ok("1") {
+                crate::input::lock_workstation();
+            }
         }
         SignalMessage::Error { message } => {
             tracing::error!("signaling error: {message}");
@@ -757,6 +772,10 @@ fn wire_clipboard_channel(dc: &glib::Object) {
 fn decode_input(bytes: &glib::Bytes) {
     let data: &[u8] = bytes;
     if data.is_empty() {
+        return;
+    }
+    // Consent gate: drop all input until the seated user has approved (REQUIRE_CONSENT).
+    if !crate::input::input_allowed() {
         return;
     }
 
