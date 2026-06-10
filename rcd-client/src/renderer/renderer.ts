@@ -74,6 +74,46 @@ const OPCODE_MOUSE_BUTTON = 0x02; //   [u8 button 0=L 1=R 2=M 3=X1 4=X2][u8 down
 const OPCODE_KEY = 0x03; //            [u16 scancode LE][u8 flags bit0=down bit1=extended]
 const OPCODE_WHEEL = 0x04; //          [i16 wheelY][i16 wheelX] WHEEL_DELTA units (+120/notch)
 // Reserved: 0x05 GAMEPAD ...
+const OPCODE_CLIPBOARD_TEXT = 0x06; // [u32 len LE][utf8 text] on the "clipboard" channel
+
+/** Build a CLIPBOARD_TEXT frame: [0x06][u32 len LE][utf8]. */
+function encodeClipboard(text: string): ArrayBuffer {
+  const utf8 = new TextEncoder().encode(text);
+  const buf = new ArrayBuffer(5 + utf8.byteLength);
+  const dv = new DataView(buf);
+  dv.setUint8(0, OPCODE_CLIPBOARD_TEXT);
+  dv.setUint32(1, utf8.byteLength, true);
+  new Uint8Array(buf, 5).set(utf8);
+  return buf;
+}
+
+/** Decode a CLIPBOARD_TEXT frame; returns the text or null if malformed. */
+function decodeClipboard(buf: ArrayBuffer): string | null {
+  if (buf.byteLength < 5) return null;
+  const dv = new DataView(buf);
+  if (dv.getUint8(0) !== OPCODE_CLIPBOARD_TEXT) return null;
+  const len = dv.getUint32(1, true);
+  if (buf.byteLength < 5 + len) return null;
+  return new TextDecoder().decode(new Uint8Array(buf, 5, len));
+}
+
+/**
+ * Local clipboard access. In Electron a preload bridge (window.rcd.clipboard) gives
+ * unrestricted access via the main process; in a plain browser we fall back to the
+ * async Clipboard API (which needs focus/permission and may reject — callers guard).
+ */
+interface ClipboardBridge {
+  readText(): Promise<string>;
+  writeText(text: string): Promise<void>;
+}
+function localClipboard(): ClipboardBridge {
+  const bridge = (window as unknown as { rcd?: { clipboard?: ClipboardBridge } }).rcd?.clipboard;
+  if (bridge) return bridge;
+  return {
+    readText: () => navigator.clipboard.readText(),
+    writeText: (t: string) => navigator.clipboard.writeText(t),
+  };
+}
 
 /** Build the 9-byte MOUSE_MOVE_ABS message (little-endian). */
 function encodeMouseMoveAbs(x: number, y: number): ArrayBuffer {
@@ -194,6 +234,11 @@ class ClientConnection {
   private ws: WebSocket | null = null;
   private pc: RTCPeerConnection | null = null;
   private inputChannel: RTCDataChannel | null = null;
+  // Clipboard sync over the reliable "clipboard" channel.
+  private clipboardChannel: RTCDataChannel | null = null;
+  private clipboardTimer: ReturnType<typeof setInterval> | null = null;
+  /** Last clipboard text synced in EITHER direction (echo-loop guard). */
+  private lastClipboard: string | null = null;
 
   // mousemove -> rAF throttle state. We coalesce moves to at most one send per
   // animation frame to avoid flooding the unreliable DataChannel.
@@ -359,13 +404,30 @@ class ClientConnection {
       if (this.video.srcObject !== s) {
         this.video.srcObject = s;
       }
+      // Latency: shrink the receive jitter buffer for the live video track. A screen
+      // feed tolerates the occasional reorder far better than added latency. Both
+      // properties are best-effort + browser-specific, hence the guarded assignment.
+      if (ev.track.kind === "video") {
+        try {
+          (ev.receiver as unknown as { jitterBufferTarget?: number }).jitterBufferTarget = 50;
+        } catch {
+          /* unsupported */
+        }
+        try {
+          (ev.receiver as unknown as { playoutDelayHint?: number }).playoutDelayHint = 0;
+        } catch {
+          /* unsupported */
+        }
+      }
       this.tryPlayWithAudio();
     };
 
-    // The HOST creates the "input" DataChannel; we receive it here.
+    // The HOST creates the DataChannels; we receive them here.
     pc.ondatachannel = (ev) => {
       if (ev.channel.label === "input") {
         this.attachInputChannel(ev.channel);
+      } else if (ev.channel.label === "clipboard") {
+        this.attachClipboardChannel(ev.channel);
       } else {
         console.warn("[rcd] unexpected data channel:", ev.channel.label);
       }
@@ -495,6 +557,58 @@ class ClientConnection {
     channel.onclose = () => {
       this.removeInputListeners();
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Clipboard sync (reliable "clipboard" channel). Bidirectional text.
+  // -------------------------------------------------------------------------
+
+  private attachClipboardChannel(channel: RTCDataChannel): void {
+    channel.binaryType = "arraybuffer";
+    this.clipboardChannel = channel;
+    channel.onopen = () => this.startClipboardSync();
+    channel.onclose = () => this.stopClipboardSync();
+    channel.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const text = decodeClipboard(ev.data);
+      if (text === null || text === this.lastClipboard) return; // malformed or our own echo
+      // Only mark as synced AFTER the local write actually succeeds — otherwise a
+      // failed write would leave the echo guard claiming a value the clipboard never
+      // got (and the poller would never re-sync it). Self-healing: on failure
+      // lastClipboard is unchanged, so the next identical message retries the write.
+      void localClipboard()
+        .writeText(text)
+        .then(() => {
+          this.lastClipboard = text;
+        })
+        .catch((e) => console.warn("[rcd] clipboard writeText failed:", e));
+    };
+  }
+
+  /** Poll the local clipboard and forward genuine local changes to the host. */
+  private startClipboardSync(): void {
+    if (this.clipboardTimer) return;
+    const clip = localClipboard();
+    this.clipboardTimer = setInterval(() => {
+      void clip
+        .readText()
+        .then((text) => {
+          if (text === this.lastClipboard) return; // unchanged or just-received echo
+          this.lastClipboard = text;
+          const ch = this.clipboardChannel;
+          if (ch && ch.readyState === "open") ch.send(encodeClipboard(text));
+        })
+        .catch(() => {
+          /* browser: no focus/permission — clipboard read not available, ignore */
+        });
+    }, 500);
+  }
+
+  private stopClipboardSync(): void {
+    if (this.clipboardTimer) {
+      clearInterval(this.clipboardTimer);
+      this.clipboardTimer = null;
+    }
   }
 
   /** Send one binary input frame if the channel is open and forwarding is enabled. */
@@ -675,6 +789,9 @@ class ClientConnection {
   /** Drop just the peer connection (e.g. host left), keep signaling alive. */
   private resetPeerConnection(): void {
     this.stopStats();
+    this.stopClipboardSync();
+    this.clipboardChannel = null;
+    this.lastClipboard = null;
     this.removeInputListeners();
     if (this.inputChannel) {
       try {

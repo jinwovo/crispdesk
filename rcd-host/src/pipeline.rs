@@ -59,12 +59,30 @@ fn res_cap() -> Option<(u32, u32)> {
 /// make clicks miss (cursor "moves but doesn't land"). Returns None for "native".
 fn scaled_dims() -> Option<(u32, u32)> {
     let cap = res_cap()?; // None => native, no scaling
-    let (sw, sh) = crate::input::primary_resolution().unwrap_or(cap);
+    // Use the SELECTED monitor's size (multi-monitor) else the primary. This keeps the
+    // encode aspect ratio matched to whichever display is actually being captured.
+    let (sw, sh) = match crate::monitors::selected() {
+        Some(m) => (m.width.max(1) as u32, m.height.max(1) as u32),
+        None => crate::input::primary_resolution().unwrap_or(cap),
+    };
     let scale = (cap.0 as f64 / sw as f64)
         .min(cap.1 as f64 / sh as f64)
         .min(1.0); // never upscale
     let even = |v: f64| ((v.round() as u32) & !1).max(2);
     Some((even(sw as f64 * scale), even(sh as f64 * scale)))
+}
+
+/// The capture source description with the selected monitor pinned, when applicable.
+/// For d3d11 capture we set `monitor-handle=<HMONITOR>` so capture targets exactly the
+/// monitor whose rect we use for input mapping (DXGI index ordering is not guaranteed
+/// to match GDI enumeration, so we bind by handle, not index).
+fn capture_src(probed: &Probed) -> String {
+    match (probed.capture.kind, crate::monitors::selected()) {
+        (CaptureKind::D3d11, Some(m)) => {
+            format!("{} monitor-handle={}", probed.capture.desc, m.handle as u64)
+        }
+        _ => probed.capture.desc.clone(),
+    }
 }
 
 /// Convert a capture source's output to system NV12, scaling to exact `dims` if given.
@@ -105,7 +123,7 @@ pub fn capture_to_rtp_chain(probed: &Probed, webrtcbin_name: &str) -> String {
          rtph264pay aggregate-mode=zero-latency pt=96 mtu={mtu} ! \
          application/x-rtp,media=video,encoding-name=H264,payload=96 ! \
          {webrtcbin_name}.",
-        src = probed.capture.desc,
+        src = capture_src(probed),
         enc = probed.encoder.element,
         tuning = probed.encoder.tuning,
     );

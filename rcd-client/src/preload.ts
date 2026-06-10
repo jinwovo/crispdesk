@@ -16,9 +16,15 @@
 // here via contextBridge.exposeInMainWorld("rcd", { ... }) — never the raw
 // ipcRenderer or Node modules.
 
-import { contextBridge } from "electron";
+import { contextBridge, ipcRenderer } from "electron";
 
 contextBridge.exposeInMainWorld("rcd", {
   // Placeholder so `window.rcd` exists; carries the milestone for diagnostics.
   version: "m1",
+  // Clipboard bridge: the renderer can't reliably use navigator.clipboard from a
+  // file:// page, so route through the main process's Electron `clipboard` module.
+  clipboard: {
+    readText: (): Promise<string> => ipcRenderer.invoke("clipboard:read"),
+    writeText: (text: string): Promise<void> => ipcRenderer.invoke("clipboard:write", text),
+  },
 });

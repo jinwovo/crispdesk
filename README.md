@@ -109,16 +109,24 @@ cargo run -- stream      # joins signaling, offers WebRTC, streams to the client
 
 Useful host env vars:
 
-| Var        | Default                  | Effect                                           |
-| ---------- | ------------------------ | ------------------------------------------------ |
-| `RES`      | `1920x1080`              | Encode resolution cap. `native` = full desktop, or `WxH`. |
-| `BITRATE`  | `12000`                  | Encoder bitrate in kbps.                          |
-| `AUDIO`    | on                       | `AUDIO=0` disables system-audio capture.          |
-| `ENCODER`  | (auto-probe)             | Force an encoder, e.g. `x264enc`.                 |
-| `CAPTURE`  | (auto-probe)             | Force a capture source.                           |
-| `RTP_MTU`  | `1200`                   | RTP packet size — **leave at 1200** (see PROTOCOL.md). |
-| `SIGNAL_URL` | `ws://127.0.0.1:8080/ws` | Signaling server URL.                          |
-| `PAIRING_CODE` | `123456`             | Room / pairing code.                              |
+| Var          | Default                  | Effect                                                    |
+| ------------ | ------------------------ | --------------------------------------------------------- |
+| `RES`        | `1920x1080`              | Encode resolution cap. `native` = full desktop, or `WxH`. |
+| `BITRATE`    | `12000`                  | Encoder/ABR ceiling in kbps.                              |
+| `BITRATE_MIN`| `1500`                   | Adaptive-bitrate floor in kbps.                           |
+| `ABR`        | on                       | `ABR=0` pins a fixed bitrate (disables adaptation).       |
+| `MONITOR`    | primary                  | Monitor index to capture + control (enumerated at startup).|
+| `AUDIO`      | on                       | `AUDIO=0` disables system-audio capture.                  |
+| `CLIPBOARD`  | on                       | `CLIPBOARD=0` disables clipboard sync.                    |
+| `ENCODER`    | (auto-probe)             | Force an encoder, e.g. `x264enc`.                         |
+| `CAPTURE`    | (auto-probe)             | Force a capture source.                                   |
+| `RTP_MTU`    | `1200`                   | RTP packet size — **leave at 1200** (see PROTOCOL.md).    |
+| `SIGNAL_URL` | `ws://127.0.0.1:8080/ws` | Signaling server URL.                                     |
+| `PAIRING_CODE` | `123456`               | Fixed code, **only** when the server runs `DEV_MODE=true`. |
+
+Signaling server env: `DEV_MODE=true` uses a fixed `PAIRING_CODE`; otherwise each
+host is issued a random code (`CODE_TTL_MS`, default 5 min) shown in the host log,
+with per-IP join rate-limiting (`JOIN_MAX_ATTEMPTS`/`JOIN_WINDOW_MS`).
 
 ### 3. Client
 
@@ -146,16 +154,32 @@ npm start              # UI: Signaling URL, Pairing Code, Connect
 - [x] **System audio** (Opus) streams alongside video.
 - [x] Works over **Tailscale** between two devices (after the RTP-MTU fix).
 
-### M1b — cross-NAT via TURN — next
+### M2 — adaptive bitrate — ✅ done
 
-- [ ] Stand up **coturn** on a VPS; wire `turnUrl` / `turnUser` / `turnPass`.
-- [ ] Connect **across different NATs** with **no port forwarding** and **no
-      popup**, including behind Korean CGNAT, using the TURN relay.
+- [x] Drive the encoder bitrate from `webrtcbin` RTCP loss feedback (AIMD with
+      hysteresis; see `rcd-host/src/abr.rs`). `ABR=0` to disable.
 
-### M2 — adaptive bitrate
+### Beyond the original plan — ✅ done
 
-- [ ] Drive the encoder bitrate from `webrtcbin` TWCC/RTCP feedback (congestion
-      control with hysteresis).
+- [x] **System audio** (Opus loopback) and **bidirectional clipboard** sync.
+- [x] **Multi-monitor** capture/control selection (`MONITOR`).
+- [x] **Dynamic pairing codes** (random, TTL, per-IP rate-limit) replacing the fixed code.
+- [x] **Robustness:** signaling auto-reconnect + keepalive; host stuck-key release on
+      disconnect; per-monitor **DPI awareness**; client **jitter-buffer** latency tuning.
+
+### M1b — cross-NAT via TURN — **next (the remaining core gap)**
+
+- [ ] Stand up **coturn** on a VPS / NAS; wire `turnUrl` / `turnUser` / `turnPass`.
+- [ ] Connect **across different NATs** with **no port forwarding**, including behind
+      Korean CGNAT, using the TURN relay. (Today: same-LAN or via Tailscale only.)
+
+### Toward a sellable product — not yet started
+
+- [ ] Signed installers (Windows code-sign, macOS notarize) + auto-update.
+- [ ] Host as a **Windows service** (control the UAC/secure desktop, run on boot).
+- [ ] Account/identity + consent UI; **wss/TLS** signaling; config UI (no env vars).
+- [ ] Replace GPL `x264enc` for proprietary distribution; address H.264 royalties.
+- [ ] Automated tests + CI; file transfer; client-driven monitor switching.
 
 ---
 

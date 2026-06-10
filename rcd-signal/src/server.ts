@@ -29,6 +29,7 @@ import {
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomInt } from "node:crypto";
 
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 
@@ -37,8 +38,22 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 // ---------------------------------------------------------------------------
 
 const PORT = Number(process.env.PORT ?? 8080);
-const PAIRING_CODE = process.env.PAIRING_CODE ?? "123456";
 const WS_PATH = "/ws"; // normative endpoint path
+
+// --- Pairing model -----------------------------------------------------------
+// DEV_MODE=true keeps the old fixed-code behaviour (room must equal PAIRING_CODE)
+// for convenient local testing. Otherwise (default) the server runs DYNAMIC pairing:
+// when a HOST joins it is assigned a fresh random code with a TTL, sent back via a
+// `code-assigned` message; a CLIENT must redeem that code to join the host's room.
+const DEV_MODE = process.env.DEV_MODE === "true";
+const PAIRING_CODE = process.env.PAIRING_CODE ?? "123456"; // DEV_MODE only
+const CODE_TTL_MS = Number(process.env.CODE_TTL_MS ?? 300_000); // 5 min
+// Per-IP client-join rate limit (brute-force defence on short codes).
+const JOIN_MAX_ATTEMPTS = Number(process.env.JOIN_MAX_ATTEMPTS ?? 10);
+const JOIN_WINDOW_MS = Number(process.env.JOIN_WINDOW_MS ?? 60_000);
+// Unambiguous alphabet (no 0/O/1/I/L) for human-typed codes.
+const CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+const CODE_LENGTH = 6;
 
 // ---------------------------------------------------------------------------
 // Protocol message types
@@ -81,6 +96,13 @@ interface ErrorMessage {
   message: string;
 }
 
+/** server -> host: the dynamically-issued pairing code (DEV_MODE off) */
+interface CodeAssignedMessage {
+  type: "code-assigned";
+  code: string;
+  expiresAt: number; // unix epoch ms
+}
+
 /** host -> client (relayed verbatim) */
 interface OfferMessage {
   type: "offer";
@@ -113,6 +135,7 @@ type OutboundMessage =
   | PeerJoinedMessage
   | PeerLeftMessage
   | ErrorMessage
+  | CodeAssignedMessage
   | RelayMessage;
 
 // ---------------------------------------------------------------------------
@@ -127,6 +150,7 @@ interface PeerState {
   id: number;
   role: Role | null;
   room: string | null;
+  ip: string;
 }
 
 let nextPeerId = 1;
@@ -139,6 +163,42 @@ const peers = new Map<WebSocket, PeerState>();
  * A room is created lazily on first join and deleted when it becomes empty.
  */
 const rooms = new Map<string, Set<WebSocket>>();
+
+// --- Dynamic pairing state (DEV_MODE off) ------------------------------------
+/** Active codes -> expiry (unix ms). A code's room name IS the code. */
+const codeExpiry = new Map<string, number>();
+/** Per-IP recent client-join attempt timestamps (rate limiting). */
+const ipAttempts = new Map<string, number[]>();
+
+/** Mint a fresh code not currently active or in use as a room. */
+function mintCode(): string {
+  for (let tries = 0; tries < 50; tries++) {
+    let code = "";
+    for (let i = 0; i < CODE_LENGTH; i++) {
+      code += CODE_ALPHABET[randomInt(CODE_ALPHABET.length)];
+    }
+    if (!codeExpiry.has(code) && !rooms.has(code)) return code;
+  }
+  // Astronomically unlikely; widen with a timestamp suffix as a last resort.
+  return `${CODE_ALPHABET[randomInt(CODE_ALPHABET.length)]}${Date.now().toString(36).toUpperCase()}`;
+}
+
+/** Drop codes whose TTL has elapsed (and whose room is gone). */
+function pruneExpiredCodes(): void {
+  const now = Date.now();
+  for (const [code, exp] of codeExpiry) {
+    if (exp < now) codeExpiry.delete(code);
+  }
+}
+
+/** Record a client-join attempt for `ip`; return false if over the rate limit. */
+function allowJoinAttempt(ip: string): boolean {
+  const now = Date.now();
+  const recent = (ipAttempts.get(ip) ?? []).filter((t) => now - t < JOIN_WINDOW_MS);
+  recent.push(now);
+  ipAttempts.set(ip, recent);
+  return recent.length <= JOIN_MAX_ATTEMPTS;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -173,67 +233,110 @@ function describe(state: PeerState): string {
 // Message handling
 // ---------------------------------------------------------------------------
 
+/**
+ * Commit a validated peer into `room` as `role`: enforce max-2 + one-per-role, set
+ * state, ack `joined`, and notify the other peer. Returns the new peer count, or null
+ * if rejected (the socket has already been closed in that case).
+ */
+function commitJoin(
+  ws: WebSocket,
+  state: PeerState,
+  room: string,
+  role: Role,
+): number | null {
+  let set = rooms.get(room);
+  if (!set) {
+    set = new Set<WebSocket>();
+    rooms.set(room, set);
+  }
+  if (set.size >= 2) {
+    rejectAndClose(ws, "room is full");
+    return null;
+  }
+  for (const peer of set) {
+    if (peers.get(peer)?.role === role) {
+      rejectAndClose(ws, `role '${role}' already present in this room`);
+      return null;
+    }
+  }
+
+  state.role = role;
+  state.room = room;
+  set.add(ws);
+  const peerCount = set.size;
+
+  send(ws, { type: "joined", role, peers: peerCount });
+  const other = otherPeerIn(room, ws);
+  if (other) {
+    send(other, { type: "peer-joined", role });
+  }
+  return peerCount;
+}
+
 function handleJoin(ws: WebSocket, state: PeerState, msg: JoinMessage): void {
   // Validate the message shape minimally.
   if (typeof msg.room !== "string" || (msg.role !== "host" && msg.role !== "client")) {
     rejectAndClose(ws, "invalid join: 'room' must be a string and 'role' must be 'host' or 'client'");
     return;
   }
-
-  // M1 pairing auth STUB: the room code must equal PAIRING_CODE.
-  // TODO(M4): replace with real account/pairing-code auth + per-pair rooms.
-  if (msg.room !== PAIRING_CODE) {
-    console.warn(`[join] ${describe(state)} rejected: wrong pairing code`);
-    rejectAndClose(ws, "invalid pairing code");
-    return;
-  }
-
   // A peer may only join once.
   if (state.room !== null) {
     rejectAndClose(ws, "already joined a room");
     return;
   }
 
-  // Get-or-create the room.
-  let set = rooms.get(msg.room);
-  if (!set) {
-    set = new Set<WebSocket>();
-    rooms.set(msg.room, set);
-  }
-
-  // Enforce max 2 peers per room.
-  if (set.size >= 2) {
-    console.warn(`[join] ${describe(state)} rejected: room '${msg.room}' is full`);
-    rejectAndClose(ws, "room is full");
+  // --- DEV_MODE: fixed code, original behaviour ---
+  if (DEV_MODE) {
+    if (msg.room !== PAIRING_CODE) {
+      console.warn(`[join] ${describe(state)} rejected: wrong pairing code (dev)`);
+      rejectAndClose(ws, "invalid pairing code");
+      return;
+    }
+    const n = commitJoin(ws, state, msg.room, msg.role);
+    if (n !== null) console.log(`[join] ${describe(state)} joined room '${msg.room}' (peers=${n})`);
     return;
   }
 
-  // Disallow two peers claiming the SAME role (we need exactly one host + one client).
-  for (const peer of set) {
-    const peerState = peers.get(peer);
-    if (peerState?.role === msg.role) {
-      console.warn(`[join] ${describe(state)} rejected: role '${msg.role}' already taken in room '${msg.room}'`);
-      rejectAndClose(ws, `role '${msg.role}' already present in this room`);
-      return;
-    }
+  // --- DYNAMIC pairing (default) ---
+  if (msg.role === "host") {
+    // Server mints a fresh code and binds it to this host's room (= the code).
+    const code = mintCode();
+    const n = commitJoin(ws, state, code, "host");
+    if (n === null) return;
+    const expiresAt = Date.now() + CODE_TTL_MS;
+    codeExpiry.set(code, expiresAt);
+    send(ws, { type: "code-assigned", code, expiresAt });
+    console.log(`[join] host ${describe(state)} assigned code ${code} (ttl ${CODE_TTL_MS}ms)`);
+    return;
   }
 
-  // Commit the join.
-  state.role = msg.role;
-  state.room = msg.room;
-  set.add(ws);
-
-  const peerCount = set.size;
-  console.log(`[join] ${describe(state)} joined room '${msg.room}' (peers=${peerCount})`);
-
-  // Ack the joining peer.
-  send(ws, { type: "joined", role: msg.role, peers: peerCount });
-
-  // Notify the OTHER peer (if any) that this one joined.
-  const other = otherPeerIn(msg.room, ws);
-  if (other) {
-    send(other, { type: "peer-joined", role: msg.role });
+  // Client: rate-limit, then redeem an active, unexpired code.
+  if (!allowJoinAttempt(state.ip)) {
+    console.warn(`[join] rate-limited client from ${state.ip}`);
+    rejectAndClose(ws, "too many join attempts; try again later");
+    return;
   }
+  // Check this specific code's existence/expiry FIRST so the error is accurate
+  // (a background timer handles bulk pruning — see below).
+  const code = msg.room.trim().toUpperCase();
+  const exp = codeExpiry.get(code);
+  if (exp === undefined) {
+    rejectAndClose(ws, "invalid pairing code");
+    return;
+  }
+  if (exp < Date.now()) {
+    codeExpiry.delete(code);
+    rejectAndClose(ws, "pairing code expired");
+    return;
+  }
+  const set = rooms.get(code);
+  const hasHost = set !== undefined && [...set].some((p) => peers.get(p)?.role === "host");
+  if (!hasHost) {
+    rejectAndClose(ws, "host not connected for this code");
+    return;
+  }
+  const n = commitJoin(ws, state, code, "client");
+  if (n !== null) console.log(`[join] client ${describe(state)} joined '${code}' (peers=${n})`);
 }
 
 function handleRelay(ws: WebSocket, state: PeerState, msg: RelayMessage): void {
@@ -303,9 +406,10 @@ function handleClose(ws: WebSocket, state: PeerState): void {
         send(other, { type: "peer-left", role: state.role });
       }
 
-      // Drop empty rooms so codes can be reused cleanly.
+      // Drop empty rooms so codes can be reused cleanly, and expire the code.
       if (set.size === 0) {
         rooms.delete(state.room);
+        codeExpiry.delete(state.room);
       }
     }
   }
@@ -361,7 +465,7 @@ const TEST_PAGE = `<!DOCTYPE html>
 <body>
   <div id="bar">
     <input id="signalUrl" type="text" spellcheck="false" />
-    <input id="pairingCode" type="text" value="123456" spellcheck="false" />
+    <input id="pairingCode" type="text" placeholder="code from host" spellcheck="false" style="text-transform:uppercase" />
     <button id="connectBtn" type="button">Connect</button>
     <label><input id="forwardInput" type="checkbox" checked /> input</label>
     <span id="status">idle</span>
@@ -410,10 +514,11 @@ function handleHttp(req: IncomingMessage, res: ServerResponse): void {
 const httpServer = createServer(handleHttp);
 const wss = new WebSocketServer({ server: httpServer, path: WS_PATH });
 
-wss.on("connection", (ws: WebSocket) => {
-  const state: PeerState = { id: nextPeerId++, role: null, room: null };
+wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+  const ip = req.socket.remoteAddress ?? "unknown";
+  const state: PeerState = { id: nextPeerId++, role: null, room: null, ip };
   peers.set(ws, state);
-  console.log(`[conn] ${describe(state)} connected`);
+  console.log(`[conn] ${describe(state)} connected from ${ip}`);
 
   ws.on("message", (data) => handleMessage(ws, state, data));
   ws.on("close", () => handleClose(ws, state));
@@ -431,7 +536,14 @@ httpServer.on("error", (err) => {
 httpServer.listen(PORT, () => {
   console.log(`rcd-signal listening on ws://0.0.0.0:${PORT}${WS_PATH}`);
   console.log(`  browser test client: http://<this-machine-ip>:${PORT}/`);
-  console.log(`  PAIRING_CODE = "${PAIRING_CODE}" (M1 stub; TODO(M4): real auth)`);
+  if (DEV_MODE) {
+    console.log(`  DEV_MODE on: fixed PAIRING_CODE = "${PAIRING_CODE}"`);
+  } else {
+    console.log(
+      `  dynamic pairing: each host is issued a ${CODE_LENGTH}-char code ` +
+        `(TTL ${CODE_TTL_MS}ms, rate-limit ${JOIN_MAX_ATTEMPTS}/${JOIN_WINDOW_MS}ms)`,
+    );
+  }
 });
 
 // Graceful shutdown so `npm start` / Ctrl-C does not leak the listener.
@@ -450,6 +562,9 @@ function shutdown(signal: string): void {
   // Failsafe: force-exit if close hangs.
   setTimeout(() => process.exit(0), 2000).unref();
 }
+
+// Periodically prune expired pairing codes (memory housekeeping).
+setInterval(pruneExpiredCodes, 60_000).unref();
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));

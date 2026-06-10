@@ -87,21 +87,32 @@ pub fn primary_resolution() -> Option<(u32, u32)> {
     }
 }
 
-/// 0x01 — move the cursor to a normalized (0..1) position on the primary monitor.
+/// 0x01 — move the cursor to a normalized (0..1) position on the SELECTED monitor
+/// (see monitors.rs; default = primary). `SetCursorPos` takes virtual-desktop
+/// coordinates (the primary's top-left is the origin; other monitors are offset), so
+/// `left + nx*width` lands the cursor on any monitor in the layout. With per-monitor
+/// DPI-V2 awareness the rect is physical pixels, matching the d3d11 capture exactly.
 pub fn mouse_move_abs(nx: f32, ny: f32) {
     let nx = nx.clamp(0.0, 1.0);
     let ny = ny.clamp(0.0, 1.0);
 
-    // SAFETY: plain Win32 FFI calls without pointer/lifetime invariants.
-    unsafe {
-        let w = GetSystemMetrics(SM_CXSCREEN);
-        let h = GetSystemMetrics(SM_CYSCREEN);
-        if w <= 0 || h <= 0 {
-            tracing::warn!("GetSystemMetrics returned non-positive screen size ({w}x{h})");
-            return;
+    // Target rect: the selected monitor, else the primary at the origin.
+    let (left, top, w, h) = match crate::monitors::selected() {
+        Some(m) => (m.left, m.top, m.width, m.height),
+        None => {
+            // SAFETY: plain Win32 FFI calls.
+            let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+            (0, 0, w, h)
         }
-        let x = (nx * (w - 1) as f32).round() as i32;
-        let y = (ny * (h - 1) as f32).round() as i32;
+    };
+    if w <= 0 || h <= 0 {
+        tracing::warn!("non-positive target monitor size ({w}x{h})");
+        return;
+    }
+    let x = left + (nx * (w - 1) as f32).round() as i32;
+    let y = top + (ny * (h - 1) as f32).round() as i32;
+    // SAFETY: plain Win32 FFI call.
+    unsafe {
         if let Err(e) = SetCursorPos(x, y) {
             tracing::warn!("SetCursorPos({x},{y}) failed: {e}");
         }

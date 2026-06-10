@@ -58,6 +58,14 @@ There are two protocols:
 | `peer-joined` | `role: "host" \| "client"`                                  | Sent to the OTHER peer when someone joins. `role` is theirs.|
 | `peer-left`   | `role: "host" \| "client"`                                  | Sent to the OTHER peer when someone leaves. `role` is theirs.|
 | `error`       | `message: string`                                           | Bad pairing code / full room. Socket is then closed.        |
+| `code-assigned` | `code: string`, `expiresAt: int` (unix ms)                | **Dynamic pairing:** server → HOST after it joins; the host shows this code for a client to enter. |
+
+**Pairing (dynamic, default):** when a HOST joins, the server mints a random
+`CODE_LENGTH`-char code (unambiguous alphabet) with a TTL (`CODE_TTL_MS`, default
+5 min), binds it to the host's room, and returns it via `code-assigned`. A CLIENT
+must `join` with that code (case-insensitive). Client joins are per-IP rate-limited
+(`JOIN_MAX_ATTEMPTS`/`JOIN_WINDOW_MS`). Set `DEV_MODE=true` on the server to instead
+use a fixed `PAIRING_CODE` (default `"123456"`) for local testing.
 
 ```json
 { "type": "joined",      "role": "host",   "peers": 2 }
@@ -213,12 +221,37 @@ The client converts browser `WheelEvent` deltas (pixels/lines) into WHEEL_DELTA
 units and flips the vertical sign (JS `+`=down, Windows `+`=up). Host injects via
 `MOUSEEVENTF_WHEEL` / `MOUSEEVENTF_HWHEEL`.
 
-### 2.3 Reserved opcodes
+### 2.3 Reserved / other opcodes
 
-| opcode | reserved for  |
-| ------ | ------------- |
-| `0x05` | gamepad state |
-| `0x06+`| future use    |
+| opcode | meaning                                       |
+| ------ | --------------------------------------------- |
+| `0x05` | gamepad state (reserved)                      |
+| `0x06` | `CLIPBOARD_TEXT` — sent on the **`clipboard`** channel, NOT `input` (see §2.4) |
+| `0x07+`| future use                                    |
+
+---
+
+## 2.4 Clipboard DataChannel
+
+Separate from `input`, the **HOST (offerer)** also creates a DataChannel labeled
+**exactly** `"clipboard"` with options `{ ordered: true }` (**reliable + ordered** —
+clipboard text must arrive intact, unlike the unreliable `input` channel). It is
+**bidirectional**: client → host and host → client. Gated by the host `CLIPBOARD`
+env (set `CLIPBOARD=0` to disable).
+
+#### Opcode `0x06` — `CLIPBOARD_TEXT` (variable length)
+
+| offset (bytes) | size | type   | field  | meaning                                   |
+| -------------- | ---- | ------ | ------ | ----------------------------------------- |
+| `0`            | 1    | u8     | opcode | `0x06` = `CLIPBOARD_TEXT`                  |
+| `1 .. 5`       | 4    | u32    | length | byte length of UTF-8 text (little-endian) |
+| `5 .. 5+len`   | var  | UTF-8  | text   | clipboard text (no null terminator)       |
+
+- Text only in v1 (images are a TODO). Host limit `CLIPBOARD_MAX_BYTES` (default 100 KB).
+- **Echo-loop prevention:** each side remembers the last text it synced in EITHER
+  direction and ignores an inbound value (or a local poll result) equal to it.
+- Host watches its clipboard by polling (`CLIPBOARD_POLL_MS`, default 500 ms); the
+  client polls via the Electron clipboard bridge (or `navigator.clipboard` in a browser).
 
 ---
 

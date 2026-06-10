@@ -28,13 +28,35 @@
 //! ==========================================================================
 
 mod abr;
+mod clipboard;
 mod input;
+mod monitors;
 mod pipeline;
 mod probe;
 mod signaling;
 mod webrtc;
 
 use anyhow::Result;
+
+/// Make the process per-monitor DPI aware (V2) BEFORE any window / metrics / GStreamer
+/// init. Without this, on a scaled display GetSystemMetrics returns LOGICAL pixels and
+/// SetCursorPos takes logical coords, while the d3d11 screen capture delivers PHYSICAL
+/// pixels — the mismatch offsets the encode size and the injected cursor. Per-monitor-V2
+/// makes every Win32 call we use see physical pixels, staying consistent with capture.
+#[cfg(windows)]
+fn set_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    // SAFETY: a plain Win32 call with no pointer/lifetime invariants.
+    unsafe {
+        if let Err(e) = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
+            tracing::warn!("SetProcessDpiAwarenessContext failed: {e} (continuing DPI-unaware)");
+        }
+    }
+}
+#[cfg(not(windows))]
+fn set_dpi_awareness() {}
 
 /// Initialize logging. Honors `RUST_LOG` (e.g. `RUST_LOG=rcd_host=debug,info`).
 /// GStreamer's own logging is controlled separately via the `GST_DEBUG` env var.
@@ -65,8 +87,15 @@ fn print_usage() {
          ENVIRONMENT:\n\
          \x20   ENCODER       Force an H.264 encoder element (e.g. \"x264enc\"), skip the probe.\n\
          \x20   CAPTURE       Force a capture source (e.g. \"gdiscreencapturesrc\"), skip the probe.\n\
+         \x20   MONITOR       Monitor to capture+control (index; unset=primary). Enumerated at startup.\n\
+         \x20   RES           Encode resolution cap WxH (default 1920x1080), or \"native\".\n\
+         \x20   BITRATE       Encoder/ABR ceiling in kbps        (default 12000)\n\
+         \x20   BITRATE_MIN   Adaptive-bitrate floor in kbps     (default 1500)\n\
+         \x20   ABR           Set ABR=0 to pin a fixed bitrate   (default: adaptive on)\n\
+         \x20   AUDIO         Set AUDIO=0 to disable system audio (default: on if available)\n\
+         \x20   CLIPBOARD     Set CLIPBOARD=0 to disable clipboard sync (default: on)\n\
          \x20   SIGNAL_URL    Signaling WebSocket URL            (default \"ws://127.0.0.1:8080/ws\")\n\
-         \x20   PAIRING_CODE  Room / pairing code                (default \"123456\")\n\
+         \x20   PAIRING_CODE  Room / pairing code (DEV_MODE only); else server-issued.\n\
          \x20   STUN          STUN server URI                    (default \"stun://stun.l.google.com:19302\")\n\
          \x20   TURN          Optional TURN URI \"turn://user:pass@host:3478\" (M1b)\n\
          \x20   RUST_LOG      Rust log filter                    (default \"rcd_host=info,warn\")\n\
@@ -80,6 +109,10 @@ fn print_usage() {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
+
+    // DPI awareness MUST be set before GStreamer (which creates D3D11 devices/windows)
+    // and before any GetSystemMetrics call. See set_dpi_awareness().
+    set_dpi_awareness();
 
     // Initialize GStreamer once, up front, before creating any element.
     gstreamer::init()?;

@@ -35,9 +35,18 @@ serde_json = "1"
 # --- Misc ---
 anyhow = "1"
 
-# --- Windows input injection (SetCursorPos / SendInput) for the "input" DataChannel ---
+# --- Windows input injection (SetCursorPos / SendInput), DPI awareness, monitor
+#     enumeration for the "input" DataChannel + multi-monitor capture/inject ---
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",        # SetProcessDpiAwarenessContext (latency/DPI feature)
+    "Win32_Graphics_Gdi",    # EnumDisplayMonitors / GetMonitorInfoW (multi-monitor)
+] }
+# Host clipboard get/set (text). Windows-only; wraps the fiddly Win32 clipboard APIs.
+clipboard-win = "5"
 
 # --- Logging ---
 tracing = "0.1"

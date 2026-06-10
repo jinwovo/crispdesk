@@ -5,7 +5,7 @@
 // only browser APIs (WebSocket, RTCPeerConnection, DOM), so the main process
 // stays intentionally thin.
 
-import { app, BrowserWindow, Menu } from "electron";
+import { app, BrowserWindow, Menu, ipcMain, clipboard } from "electron";
 import * as path from "node:path";
 
 function createWindow(): void {
@@ -37,6 +37,12 @@ app.whenReady().then(() => {
   // Kill the default application menu so its accelerators (Ctrl+W close,
   // Ctrl+R reload, F11, ...) don't swallow keystrokes we forward to the host.
   Menu.setApplicationMenu(null);
+
+  // Clipboard bridge for the renderer (see preload.ts).
+  ipcMain.handle("clipboard:read", () => clipboard.readText());
+  ipcMain.handle("clipboard:write", (_ev, text: unknown) => {
+    clipboard.writeText(typeof text === "string" ? text : "");
+  });
 
   createWindow();
 

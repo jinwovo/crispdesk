@@ -66,6 +66,15 @@ pub enum SignalMessage {
         message: String,
     },
 
+    /// server -> host: the server-issued pairing code the user gives to a client
+    /// (dynamic-pairing mode; see rcd-signal). `expires_at` is unix epoch ms.
+    #[serde(rename = "code-assigned")]
+    CodeAssigned {
+        code: String,
+        #[serde(rename = "expiresAt")]
+        expires_at: u64,
+    },
+
     /// host -> client (relayed): the SDP offer (full SDP string).
     Offer {
         sdp: String,

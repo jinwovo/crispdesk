@@ -73,6 +73,9 @@ struct Session {
 pub async fn run() -> Result<()> {
     let (signal_url, pairing_code) = signaling::config_from_env();
 
+    // Resolve the capture/control monitor (MONITOR env; default primary) and log all.
+    crate::monitors::init_from_env();
+
     // Probe ONCE for a working encoder + capture source (reused across reconnects).
     let probed = crate::probe::probe_all().context("encoder/capture probe failed")?;
     tracing::info!(
@@ -81,6 +84,10 @@ pub async fn run() -> Result<()> {
         probed.encoder.kind,
         probed.capture.desc
     );
+
+    // Start the host clipboard poller once (it forwards LOCAL clipboard changes to the
+    // current session's "clipboard" DataChannel; see clipboard.rs). No-op if disabled.
+    crate::clipboard::start_poller();
 
     // Drive a shared GLib main loop on a dedicated thread: webrtcbin signals, bus
     // watches, and promises are serviced here for ALL sessions.
@@ -179,6 +186,8 @@ fn teardown_session(session: &mut Option<Session>) {
         // Backstop: a client that vanished without sending key/button-ups must not
         // leave stuck modifiers or held mouse buttons on the host desktop.
         crate::input::release_all();
+        // Drop the clipboard channel handle so the poller stops sending into a dead session.
+        crate::clipboard::set_channel(None);
         tracing::info!("session torn down");
     }
 }
@@ -280,6 +289,15 @@ fn handle_signal(
         }
         SignalMessage::Error { message } => {
             tracing::error!("signaling error: {message}");
+        }
+        // The server issued our pairing code — show it prominently for the user to
+        // hand to a client. (Dynamic-pairing mode; see rcd-signal.)
+        SignalMessage::CodeAssigned { code, expires_at } => {
+            tracing::info!("==================================================");
+            tracing::info!("   PAIRING CODE:  {code}");
+            tracing::info!("   Enter this code on the client to connect.");
+            tracing::info!("   (expires at unix-ms {expires_at})");
+            tracing::info!("==================================================");
         }
         // The client's SDP answer -> set as remote description on the live session.
         SignalMessage::Answer { sdp } => {
@@ -427,6 +445,26 @@ fn build_pipeline(
                      (Is the pipeline at least READY?)"
                 );
             }
+        }
+    }
+
+    // --- Create the RELIABLE "clipboard" DataChannel (ordered, no retransmit limit). ---
+    // Unlike "input" (unreliable/newest-wins), clipboard text must arrive intact and in
+    // order. Gated by CLIPBOARD env (clipboard::enabled).
+    if crate::clipboard::enabled() {
+        let dc_opts = gst::Structure::builder("application/data-channel")
+            .field("ordered", true)
+            .build();
+        let clip = state.webrtcbin.emit_by_name::<Option<glib::Object>>(
+            "create-data-channel",
+            &[&"clipboard", &dc_opts],
+        );
+        match clip {
+            Some(dc) => {
+                tracing::info!("Created DataChannel 'clipboard' (ordered, reliable)");
+                wire_clipboard_channel(&dc);
+            }
+            None => tracing::error!("create-data-channel('clipboard') returned None"),
         }
     }
 
@@ -590,6 +628,33 @@ fn wire_data_channel(dc: &glib::Object) {
     });
     dc.connect("on-error", false, move |values| {
         tracing::warn!("DataChannel error: {:?}", values.get(1));
+        None
+    });
+}
+
+/// Wire the reliable "clipboard" DataChannel: inbound text -> host clipboard; register
+/// the channel so the host clipboard poller can push LOCAL changes to the client.
+fn wire_clipboard_channel(dc: &glib::Object) {
+    dc.connect("on-message-data", false, move |values| {
+        if let Ok(bytes) = values[1].get::<glib::Bytes>() {
+            crate::clipboard::handle_incoming(&bytes);
+        }
+        None
+    });
+
+    // Register the channel for the poller on open. We pull the channel from the
+    // signal's emitter arg (values[0]) instead of capturing `dc`, so the closure stays
+    // Send (glib::Object is not Send, and connect() requires a Send + Sync closure).
+    dc.connect("on-open", false, move |values| {
+        tracing::info!("DataChannel 'clipboard' open");
+        if let Ok(obj) = values[0].get::<glib::Object>() {
+            crate::clipboard::set_channel(Some(obj));
+        }
+        None
+    });
+    dc.connect("on-close", false, move |_| {
+        tracing::info!("DataChannel 'clipboard' closed");
+        crate::clipboard::set_channel(None);
         None
     });
 }
