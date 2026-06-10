@@ -30,6 +30,7 @@
 mod abr;
 mod audit;
 mod clipboard;
+mod embedded_signaling;
 mod input;
 mod monitors;
 mod pipeline;
@@ -80,7 +81,8 @@ fn print_usage() {
          USAGE:\n\
          \x20   cargo run -- probe       Print which H.264 encoder + capture source this PC supports.\n\
          \x20   cargo run -- preview     Self-contained capture->encode->decode->window test (no network).\n\
-         \x20   cargo run -- stream      Join signaling, negotiate WebRTC, stream video, receive input.\n\
+         \x20   cargo run -- stream      Join an EXTERNAL signaling server, stream video, receive input.\n\
+         \x20   cargo run -- serve       Run signaling IN-PROCESS (no separate server) + stream.\n\
          \n\
          The encoder + capture source are AUTO-DETECTED at runtime (NVENC -> QSV -> AMF\n\
          -> Media Foundation -> software). Override with the env vars below.\n\
@@ -132,6 +134,36 @@ async fn main() -> Result<()> {
         }
         Some("stream") => {
             tracing::info!("Mode: stream (WebRTC offerer)");
+            webrtc::run().await?;
+        }
+        Some("serve") => {
+            // Embedded signaling + stream: no separate server needed. The client
+            // connects to ws://<this-host-ip>:<port>/ws with the PIN below.
+            let port: u16 = std::env::var("PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080);
+            let pin = std::env::var("PAIRING_CODE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| embedded_signaling::generate_pin(6));
+
+            // Point the host's own WebRTC client at the embedded server.
+            std::env::set_var("SIGNAL_URL", format!("ws://127.0.0.1:{port}/ws"));
+            std::env::set_var("PAIRING_CODE", &pin);
+
+            tracing::info!("Mode: serve (embedded signaling on :{port} + WebRTC offerer)");
+            {
+                let pin = pin.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = embedded_signaling::serve(port, pin).await {
+                        tracing::error!("embedded signaling server failed: {e:?}");
+                    }
+                });
+            }
+            // Let the listener bind before the host connects to it.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tracing::info!("Connect a client to ws://<this-host-ip>:{port}/ws — PIN below.");
             webrtc::run().await?;
         }
         _ => {

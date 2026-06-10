@@ -104,8 +104,16 @@ npm run dev            # ws://0.0.0.0:8080/ws ; PAIRING_CODE=123456
 cd rcd-host
 cargo run -- probe       # print what THIS machine supports (encoder + capture)
 cargo run -- preview     # local-only window: proves capture + HW encode works
-cargo run -- stream      # joins signaling, offers WebRTC, streams to the client
+cargo run -- serve       # NO separate server: run signaling in-process + stream
+cargo run -- stream      # use an EXTERNAL signaling server (rcd-signal) instead
 ```
+
+**Two apps only (`serve`):** like Moonlight, you can skip the separate signaling
+server. `cargo run -- serve` runs the relay **inside the host** on `PORT` (8080) and
+prints a **PIN**. On the other machine, point the client at
+`ws://<host-ip>:8080/ws` (the host's LAN or Tailscale IP) and enter the PIN — that's
+it. Over **Tailscale this needs no port forwarding and no NAS**. (For arbitrary
+internet behind CGNAT without a VPN, you still need a reachable relay — see TURN.)
 
 Useful host env vars:
 

@@ -24,7 +24,7 @@ gstreamer-app = "0.23"
 glib = "0.20"
 
 # --- Async runtime + WebSocket signaling client ---
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 
