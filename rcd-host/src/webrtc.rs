@@ -47,7 +47,17 @@ const OPCODE_MOUSE_MOVE_ABS: u8 = 0x01; // [f32 x][f32 y] normalized 0..1
 const OPCODE_MOUSE_BUTTON: u8 = 0x02; //   [u8 button 0=L 1=R 2=M 3=X1 4=X2][u8 down(1)/up(0)]
 const OPCODE_KEY: u8 = 0x03; //            [u16 scancode][u8 flags bit0=down bit1=extended]
 const OPCODE_WHEEL: u8 = 0x04; //          [i16 wheelY][i16 wheelX] WHEEL_DELTA units (+120/notch)
-// TODO(milestone): 0x05 GAMEPAD (ViGEmBus), clipboard channel, etc.
+// TODO(milestone): 0x05 GAMEPAD (ViGEmBus).
+
+/// Commands marshalled from DataChannel callbacks (GLib thread) into the host's
+/// main loop below, which owns the `Session` and can rebuild/retune it.
+#[derive(Debug, Clone, Copy)]
+pub enum HostCmd {
+    /// Rebuild the session capturing monitor `index` (control `switch-monitor`).
+    SwitchMonitor(usize),
+    /// Move the encoder/ABR bitrate ceiling live (control `set-bitrate`; 0 = default).
+    SetBitrate(u32),
+}
 
 /// Shared bundle so signal callbacks (which need 'static closures) can reach the
 /// pieces they require: the webrtcbin element and a sender back into signaling.
@@ -100,6 +110,9 @@ pub async fn run() -> Result<()> {
     let mut session: Option<Session> = None;
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
     let mut backoff_secs = 1u64;
+    // Control-channel commands (monitor switch / bitrate) arrive on the GLib thread;
+    // this channel marshals them into the loop below, which owns the Session.
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<HostCmd>();
     // Latest ICE servers from the signaling server (STUN + ephemeral TURN creds).
     // The server sends these right after we join, before any negotiation.
     let mut ice_servers: Vec<IceServerCfg> = Vec::new();
@@ -149,7 +162,14 @@ pub async fn run() -> Result<()> {
                         tracing::warn!("signaling connection lost; tearing down and reconnecting");
                         break; // inner break -> reconnect
                     };
-                    handle_signal(&mut session, &sig.outbound, &probed, &mut ice_servers, msg);
+                    handle_signal(&mut session, &sig.outbound, &probed, &mut ice_servers, &cmd_tx, msg);
+                }
+
+                maybe_cmd = cmd_rx.recv() => {
+                    // cmd_tx lives in this scope, so recv() cannot return None; guard anyway.
+                    if let Some(cmd) = maybe_cmd {
+                        handle_command(&mut session, &sig.outbound, &probed, &ice_servers, &cmd_tx, cmd).await;
+                    }
                 }
 
                 _ = abr_tick.tick() => {
@@ -158,7 +178,16 @@ pub async fn run() -> Result<()> {
                         // doesn't conflict with the &borrows of webrtcbin/venc.
                         let wb = s.state.webrtcbin.clone();
                         if let Some(venc) = s.venc.clone() {
-                            s.abr.tick(&wb, &venc);
+                            // Forward the tick's stats to the client HUD. With ABR=0
+                            // and no control channel open, tick() skips the get-stats
+                            // call entirely (the original escape-hatch guarantee).
+                            if let Some(st) = s.abr.tick(&wb, &venc, crate::control::has_channel()) {
+                                crate::control::send(&crate::control::ToClient::Stats {
+                                    encoder_kbps: st.kbps,
+                                    loss_pct: (st.loss_pct * 10.0).round() / 10.0,
+                                    rtt_ms: st.rtt_ms.round(),
+                                });
+                            }
                         }
                     }
                 }
@@ -189,28 +218,37 @@ fn teardown_session(session: &mut Option<Session>) {
         // Backstop: a client that vanished without sending key/button-ups must not
         // leave stuck modifiers or held mouse buttons on the host desktop.
         crate::input::release_all();
-        // Drop the clipboard channel handle so the poller stops sending into a dead session.
+        // Drop the clipboard/control/file channel handles so nothing sends into a
+        // dead session, and abort any in-flight file transfers (deletes .part temps).
         crate::clipboard::set_channel(None);
+        crate::control::set_channel(None);
+        crate::files::set_channel(None);
+        crate::files::reset();
         crate::audit::log_event("session_end", &[]);
         tracing::info!("session torn down");
     }
 }
 
 /// Build a FRESH session for a newly-present client and start negotiating.
+/// `rebuild` = an internal restart for the SAME already-connected peer (e.g. a
+/// monitor switch), as opposed to a new client session. Returns success — a caller
+/// that triggered a rebuild can roll back when the new pipeline fails to come up.
 fn start_session(
     session: &mut Option<Session>,
     signal_tx: &mpsc::UnboundedSender<SignalMessage>,
     probed: &Probed,
     ice_servers: &[IceServerCfg],
-) {
+    cmd_tx: &mpsc::UnboundedSender<HostCmd>,
+    rebuild: bool,
+) -> bool {
     // A previous session (e.g. the client refreshed the page) cannot be reused.
     teardown_session(session);
 
-    let (pipeline, state) = match build_pipeline(signal_tx.clone(), probed, ice_servers) {
+    let (pipeline, state) = match build_pipeline(signal_tx.clone(), probed, ice_servers, cmd_tx) {
         Ok(ps) => ps,
         Err(e) => {
             tracing::error!("failed to build session pipeline: {e:?}");
-            return;
+            return false;
         }
     };
 
@@ -219,7 +257,7 @@ fn start_session(
         Some(b) => b,
         None => {
             tracing::error!("session pipeline has no bus");
-            return;
+            return false;
         }
     };
     let watch = bus.add_watch(move |_bus, msg| {
@@ -242,22 +280,26 @@ fn start_session(
         Ok(w) => w,
         Err(e) => {
             tracing::error!("failed to add bus watch: {e}");
-            return;
+            return false;
         }
     };
 
     tracing::info!("Client present -> starting a fresh WebRTC session (PLAYING)");
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
         tracing::error!("failed to set session pipeline to PLAYING: {e}");
-        return;
+        return false;
     }
 
     // Consent gate: with REQUIRE_CONSENT=1 input stays blocked until the seated user
     // approves the modal dialog; otherwise input is enabled immediately (unchanged).
-    if std::env::var("REQUIRE_CONSENT").as_deref() == Ok("1") {
-        crate::input::request_consent();
-    } else {
-        crate::input::set_input_allowed(true);
+    // An internal REBUILD keeps the existing gate — it is the same, already-approved
+    // peer, and re-prompting would revoke input on an unattended host mid-session.
+    if !rebuild {
+        if std::env::var("REQUIRE_CONSENT").as_deref() == Ok("1") {
+            crate::input::request_consent();
+        } else {
+            crate::input::set_input_allowed(true);
+        }
     }
     crate::audit::log_event("session_start", &[("encoder", &probed.encoder.element)]);
 
@@ -265,6 +307,11 @@ fn start_session(
     // pipeline.rs ("venc"). Absent only if the pipeline shape changed.
     let venc = pipeline.by_name("venc");
     let abr = crate::abr::AbrState::new(probed.encoder.element.clone());
+    // The fresh encoder element starts at its tuning-string default — push the
+    // (possibly client-overridden, rebuild-surviving) target explicitly.
+    if let Some(v) = venc.as_ref() {
+        abr.apply(v);
+    }
 
     *session = Some(Session {
         pipeline,
@@ -273,6 +320,7 @@ fn start_session(
         abr,
         _bus_watch: watch,
     });
+    true
 }
 
 /// React to one inbound signaling message.
@@ -281,6 +329,7 @@ fn handle_signal(
     signal_tx: &mpsc::UnboundedSender<SignalMessage>,
     probed: &Probed,
     ice_servers: &mut Vec<IceServerCfg>,
+    cmd_tx: &mpsc::UnboundedSender<HostCmd>,
     msg: SignalMessage,
 ) {
     match msg {
@@ -288,14 +337,14 @@ fn handle_signal(
         SignalMessage::Joined { role, peers } => {
             tracing::info!("joined room as {role:?}; peers in room = {peers}");
             if peers >= 2 {
-                start_session(session, signal_tx, probed, ice_servers);
+                start_session(session, signal_tx, probed, ice_servers, cmd_tx, false);
             }
         }
         // The other peer joined (or rejoined after a refresh): start a fresh session.
         SignalMessage::PeerJoined { role } => {
             tracing::info!("peer joined: {role:?}");
             if role == Role::Client {
-                start_session(session, signal_tx, probed, ice_servers);
+                start_session(session, signal_tx, probed, ice_servers, cmd_tx, false);
             }
         }
         // The signaling server handed us ICE servers (STUN + ephemeral TURN). Store
@@ -307,6 +356,9 @@ fn handle_signal(
         SignalMessage::PeerLeft { role } => {
             tracing::warn!("peer left: {role:?}");
             teardown_session(session);
+            // The departing peer's bitrate choice must not cap the NEXT client's
+            // session (it deliberately survives internal rebuilds, not peer changes).
+            crate::abr::clear_override();
             // Optionally lock the workstation so the desktop isn't left unlocked after
             // a remote session ends (only on a real peer-leave, not a session rebuild).
             if std::env::var("LOCK_ON_DISCONNECT").as_deref() == Ok("1") {
@@ -361,11 +413,117 @@ fn handle_signal(
     }
 }
 
+/// Execute one control-channel command (already marshalled off the GLib thread).
+async fn handle_command(
+    session: &mut Option<Session>,
+    signal_tx: &mpsc::UnboundedSender<SignalMessage>,
+    probed: &Probed,
+    ice_servers: &[IceServerCfg],
+    cmd_tx: &mpsc::UnboundedSender<HostCmd>,
+    cmd: HostCmd,
+) {
+    // Same consent gate as input/clipboard/files: an unapproved peer may watch
+    // (consent covers the initial screen) but not steer the host's capture/encode.
+    if !crate::input::input_allowed() {
+        crate::control::send(&crate::control::ToClient::Error {
+            message: "consent not granted on host".into(),
+        });
+        return;
+    }
+    match cmd {
+        HostCmd::SwitchMonitor(index) => {
+            if session.is_none() {
+                tracing::warn!("switch-monitor with no live session; ignoring");
+                return;
+            }
+            // Validate WITHOUT mutating the live selection: until the old session is
+            // torn down it keeps injecting input, and its coordinate mapping must
+            // stay on the monitor the client is still seeing.
+            let count = crate::monitors::all().len();
+            if index >= count {
+                crate::control::send(&crate::control::ToClient::Error {
+                    message: format!("monitor index {index} out of range ({count} monitor(s) detected)"),
+                });
+                return;
+            }
+            let prev = crate::monitors::current_index();
+            tracing::info!("client requested monitor switch [{prev}] -> [{index}]; rebuilding session");
+            crate::audit::log_event("monitor_switch", &[("index", &index.to_string())]);
+            // Tell the client to reset + await the fresh offer, then give the message
+            // a moment to flush before the channel dies with the old session. (Belt-
+            // and-braces: if it is lost, the client still detects the rebuild by the
+            // new offer's changed DTLS fingerprint.)
+            crate::control::send(&crate::control::ToClient::Restart {
+                reason: "monitor-switch".into(),
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Retarget only AFTER the old session (and its input path) is dead, so
+            // capture and input mapping flip together.
+            teardown_session(session);
+            let switched = crate::monitors::select_index(index).is_ok()
+                && start_session(session, signal_tx, probed, ice_servers, cmd_tx, true);
+            if !switched {
+                // One bad display must not kill the whole connection: restore the
+                // previous monitor and rebuild there, so the client still gets an
+                // offer instead of waiting forever.
+                tracing::warn!("monitor switch to [{index}] failed; rolling back to [{prev}]");
+                let _ = crate::monitors::select_index(prev);
+                if !start_session(session, signal_tx, probed, ice_servers, cmd_tx, true) {
+                    tracing::error!("rollback rebuild failed too; waiting for the client to rejoin");
+                }
+            }
+        }
+        HostCmd::SetBitrate(kbps) => match session.as_mut() {
+            Some(s) => {
+                let Some(venc) = s.venc.clone() else {
+                    tracing::warn!("set-bitrate: no encoder element; ignoring");
+                    return;
+                };
+                s.abr.set_ceiling(&venc, kbps);
+            }
+            None => tracing::warn!("set-bitrate with no live session; ignoring"),
+        },
+    }
+}
+
+/// Create one host-owned DataChannel on `webrtcbin`. `ordered` toggles in-order
+/// delivery; `max_retransmits` (e.g. `Some(0)` for the unreliable "input" channel)
+/// is set only when given. Logs and returns `None` if webrtcbin refuses (e.g. the
+/// pipeline is not yet READY) — the caller treats that as a non-fatal skip.
+fn create_channel(
+    webrtcbin: &gst::Element,
+    label: &str,
+    ordered: bool,
+    max_retransmits: Option<i32>,
+) -> Option<glib::Object> {
+    let mut builder = gst::Structure::builder("application/data-channel").field("ordered", ordered);
+    if let Some(mr) = max_retransmits {
+        builder = builder.field("max-retransmits", mr);
+    }
+    let opts = builder.build();
+    let dc =
+        webrtcbin.emit_by_name::<Option<glib::Object>>("create-data-channel", &[&label, &opts]);
+    match &dc {
+        Some(_) => tracing::info!(
+            "Created DataChannel '{label}' (ordered={ordered}{})",
+            match max_retransmits {
+                Some(mr) => format!(", max-retransmits={mr}"),
+                None => String::new(),
+            }
+        ),
+        None => tracing::error!(
+            "create-data-channel('{label}') returned None; is the pipeline at least READY?"
+        ),
+    }
+    dc
+}
+
 /// Build one session's streaming pipeline and wire all webrtcbin signals.
 fn build_pipeline(
     signal_tx: mpsc::UnboundedSender<SignalMessage>,
     probed: &Probed,
     ice_servers: &[IceServerCfg],
+    cmd_tx: &mpsc::UnboundedSender<HostCmd>,
 ) -> Result<(gst::Pipeline, Arc<AppState>)> {
     // The capture/encode/parse/pay chain is defined in pipeline.rs so preview and stream
     // share one source-of-truth. It ends by feeding into our `webrtcbin`.
@@ -453,48 +611,24 @@ fn build_pipeline(
         .set_state(gst::State::Ready)
         .context("failed to set streaming pipeline to READY")?;
 
-    // --- Create the "input" DataChannel BEFORE negotiation (host = offerer owns it). ---
-    {
-        let dc_opts = gst::Structure::builder("application/data-channel")
-            .field("ordered", false)
-            .field("max-retransmits", 0i32)
-            .build();
-        let data_channel = state.webrtcbin.emit_by_name::<Option<glib::Object>>(
-            "create-data-channel",
-            &[&"input", &dc_opts],
-        );
-
-        match data_channel {
-            Some(dc) => {
-                tracing::info!("Created DataChannel 'input' (ordered=false, max-retransmits=0)");
-                wire_data_channel(&dc);
-            }
-            None => {
-                tracing::error!(
-                    "create-data-channel returned None; input will not work. \
-                     (Is the pipeline at least READY?)"
-                );
-            }
+    // --- Create the host-owned DataChannels BEFORE negotiation (host = offerer). ---
+    // The "input" channel is unreliable/unordered (newest-wins); the rest are reliable
+    // + ordered. Each is wired by its own handler; a None return is logged, not fatal
+    // (additive — a missing auxiliary channel never breaks the video/input path).
+    if let Some(dc) = create_channel(&webrtcbin, "input", false, Some(0)) {
+        wire_data_channel(&dc);
+    }
+    if crate::clipboard::enabled() {
+        if let Some(dc) = create_channel(&webrtcbin, "clipboard", true, None) {
+            wire_clipboard_channel(&dc);
         }
     }
-
-    // --- Create the RELIABLE "clipboard" DataChannel (ordered, no retransmit limit). ---
-    // Unlike "input" (unreliable/newest-wins), clipboard text must arrive intact and in
-    // order. Gated by CLIPBOARD env (clipboard::enabled).
-    if crate::clipboard::enabled() {
-        let dc_opts = gst::Structure::builder("application/data-channel")
-            .field("ordered", true)
-            .build();
-        let clip = state.webrtcbin.emit_by_name::<Option<glib::Object>>(
-            "create-data-channel",
-            &[&"clipboard", &dc_opts],
-        );
-        match clip {
-            Some(dc) => {
-                tracing::info!("Created DataChannel 'clipboard' (ordered, reliable)");
-                wire_clipboard_channel(&dc);
-            }
-            None => tracing::error!("create-data-channel('clipboard') returned None"),
+    if let Some(dc) = create_channel(&webrtcbin, "control", true, None) {
+        wire_control_channel(&dc, cmd_tx.clone(), probed.encoder.element.clone());
+    }
+    if crate::files::enabled() {
+        if let Some(dc) = create_channel(&webrtcbin, "file", true, None) {
+            wire_file_channel(&dc);
         }
     }
 
@@ -761,9 +895,87 @@ fn wire_clipboard_channel(dc: &glib::Object) {
         }
         None
     });
-    dc.connect("on-close", false, move |_| {
+    // Identity-guarded clear: a torn-down session's channel can close AFTER the
+    // rebuilt session registered its own — that stale close must not clobber it.
+    dc.connect("on-close", false, move |values| {
         tracing::info!("DataChannel 'clipboard' closed");
-        crate::clipboard::set_channel(None);
+        if let Ok(obj) = values[0].get::<glib::Object>() {
+            crate::clipboard::clear_channel_if(&obj);
+        }
+        None
+    });
+}
+
+/// Wire the reliable "control" DataChannel: JSON TEXT messages. Inbound commands are
+/// marshalled to the main loop via `cmd_tx` (this callback runs on the GLib thread);
+/// on open we register the channel for host->client sends and push the `hello`
+/// snapshot (monitor list, encoder, capabilities).
+fn wire_control_channel(
+    dc: &glib::Object,
+    cmd_tx: mpsc::UnboundedSender<HostCmd>,
+    encoder: String,
+) {
+    dc.connect("on-message-string", false, move |values| {
+        if let Ok(text) = values[1].get::<String>() {
+            match crate::control::parse_from_client(&text) {
+                Some(crate::control::FromClient::SwitchMonitor { index }) => {
+                    let _ = cmd_tx.send(HostCmd::SwitchMonitor(index));
+                }
+                Some(crate::control::FromClient::SetBitrate { kbps }) => {
+                    let _ = cmd_tx.send(HostCmd::SetBitrate(kbps));
+                }
+                None => {} // unknown/malformed: ignored (forward-compat)
+            }
+        }
+        None
+    });
+
+    // Pull the channel from the emitter arg (values[0]) instead of capturing `dc`
+    // so the closure stays Send (same pattern as the clipboard channel).
+    dc.connect("on-open", false, move |values| {
+        tracing::info!("DataChannel 'control' open");
+        if let Ok(obj) = values[0].get::<glib::Object>() {
+            crate::control::set_channel(Some(obj));
+            crate::control::send(&crate::control::hello(&encoder));
+        }
+        None
+    });
+    // Identity-guarded clear (see the clipboard channel note).
+    dc.connect("on-close", false, move |values| {
+        tracing::info!("DataChannel 'control' closed");
+        if let Ok(obj) = values[0].get::<glib::Object>() {
+            crate::control::clear_channel_if(&obj);
+        }
+        None
+    });
+}
+
+/// Wire the reliable "file" DataChannel: inbound frames drive the receive state
+/// machine in files.rs; the registered channel is its reply path (accept/reject/done).
+fn wire_file_channel(dc: &glib::Object) {
+    dc.connect("on-message-data", false, move |values| {
+        if let Ok(bytes) = values[1].get::<glib::Bytes>() {
+            crate::files::handle_incoming(&bytes);
+        }
+        None
+    });
+    dc.connect("on-open", false, move |values| {
+        tracing::info!("DataChannel 'file' open");
+        if let Ok(obj) = values[0].get::<glib::Object>() {
+            crate::files::set_channel(Some(obj));
+        }
+        None
+    });
+    dc.connect("on-close", false, move |values| {
+        tracing::info!("DataChannel 'file' closed");
+        // Abort in-flight transfers only when the CURRENT channel closed — a stale
+        // close from a torn-down session must not delete the new session's .part
+        // files or deregister its reply channel.
+        if let Ok(obj) = values[0].get::<glib::Object>() {
+            if crate::files::clear_channel_if(&obj) {
+                crate::files::reset();
+            }
+        }
         None
     });
 }

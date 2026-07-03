@@ -28,12 +28,17 @@ video and receives input; the client shows video and sends input.
 - `rcd-host/src/main.rs` — entry + arg dispatch (`probe`/`preview`/`stream`), DPI awareness, logging.
 - `rcd-host/src/probe.rs` — runtime encoder + capture ladders (the "universal HW encode").
 - `rcd-host/src/pipeline.rs` — the capture→encode→pay GStreamer chain + aspect-fit math.
-- `rcd-host/src/webrtc.rs` — STREAM mode: webrtcbin negotiation, DataChannels, input decode.
+- `rcd-host/src/webrtc.rs` — STREAM mode: webrtcbin negotiation, DataChannels, input decode,
+  `HostCmd` marshalling (GLib thread → main loop) for monitor-switch session rebuilds.
 - `rcd-host/src/signaling.rs` — WS client, the `SignalMessage` enum (normative field names).
 - `rcd-host/src/input.rs` — Win32 `SendInput`/`SetCursorPos` injection + stuck-key backstop.
-- `rcd-host/src/abr.rs` — adaptive bitrate (AIMD on RTCP loss).
+- `rcd-host/src/abr.rs` — adaptive bitrate (AIMD on RTCP loss) + live client-set ceiling.
 - `rcd-host/src/clipboard.rs` — host-side clipboard poller + bidi sync.
-- `rcd-host/src/monitors.rs` — multi-monitor enumeration + selection (`MONITOR`).
+- `rcd-host/src/control.rs` — the JSON `"control"` channel (hello/stats/restart ↔ switch-monitor/set-bitrate).
+- `rcd-host/src/files.rs` — the `"file"` channel receive path (sanitize, size cap, `.part`+rename).
+- `rcd-host/src/sendchan.rs` — shared `ChannelSlot` (one `unsafe impl Send/Sync` for the DataChannel send-handle, reused by clipboard/control/files).
+- `rcd-host/src/env.rs` — env-var helpers (`on("VAR")` for the `VAR=0` disable convention, `parse_or`).
+- `rcd-host/src/monitors.rs` — multi-monitor enumeration + runtime-mutable selection (`MONITOR`, `switch-monitor`).
 - `rcd-signal/src/server.ts` — the relay (HTTP + WS), rooms, dynamic pairing, ICE-server minting.
 - `rcd-signal/src/pairing.ts` — pure helpers (code gen, TURN creds, rate limit, origin allowlist); unit-tested.
 - `rcd-client/src/renderer/renderer.ts` — the answerer; all WebRTC/signaling/input lives here.
@@ -81,13 +86,15 @@ needs a server, which is explicitly out of scope for code-only work here).
 
 ## DataChannels
 
-Both channels are **created by the HOST (offerer)** before negotiation; the client
+All channels are **created by the HOST (offerer)** before negotiation; the client
 receives them via `pc.ondatachannel`. See PROTOCOL.md §2 for exact byte layouts.
 
 | Label       | Options                            | Reliability        | Direction        | Payload |
 | ----------- | ---------------------------------- | ------------------ | ---------------- | ------- |
 | `"input"`   | `ordered:false, max-retransmits:0` | unreliable/unordered (newest wins) | client → host | opcodes `0x01`–`0x04` |
 | `"clipboard"`| `ordered:true`                    | reliable + ordered | bidirectional    | opcode `0x06` |
+| `"control"` | `ordered:true`                     | reliable + ordered | bidirectional    | **JSON text** (PROTOCOL.md §2.5) |
+| `"file"`    | `ordered:true` (absent if `FILES=0`)| reliable + ordered | client → host (M1) | opcodes `0x10`–`0x14` (§2.6) |
 
 **Input opcodes** (all multi-byte fields little-endian):
 - `0x01 MOUSE_MOVE_ABS` (9 B): `[f32 x][f32 y]` normalized `0..1` within the video **content** rect.
@@ -98,6 +105,19 @@ receives them via `pc.ondatachannel`. See PROTOCOL.md §2 for exact byte layouts
 
 Clipboard sync has **echo-loop prevention** on both sides (remember the last text
 synced in either direction; ignore an inbound/poll value equal to it).
+
+**Control channel** (JSON; kebab-case `type`, camelCase fields; unknown types ignored):
+host → client `hello` (monitor list/encoder/capabilities on open), `stats` (~1 Hz),
+`restart` (session rebuild incoming — client resets and answers the fresh offer),
+`error`; client → host `switch-monitor {index}`, `set-bitrate {kbps}` (0 = default;
+persists across rebuilds). A **monitor switch is a session rebuild** over the live
+signaling socket: the client detects the new session by the `restart` message OR the
+offer's changed DTLS fingerprint and answers on a **fresh** RTCPeerConnection.
+
+**File channel**: `FILE_OFFER {id,size,name}` → `FILE_ACCEPT`/`FILE_REJECT` →
+`FILE_CHUNK`* (≤16 KiB, offsets implicit on the ordered channel) → `FILE_DONE`,
+acked by a receiver-side `FILE_DONE` after size verification + `.part`→final rename.
+Host sanitizes filenames, caps size (`FILE_MAX_BYTES`), and respects the consent gate.
 
 ---
 
@@ -134,6 +154,9 @@ wasapi2src loopback=true low-latency=true ! audioconvert ! audioresample
   would offset every normalized mouse coordinate and make clicks miss.
 - **ABR** (`abr.rs`): ~1 Hz AIMD on RTCP loss — loss >5% cut to 85%, loss <2% add
   500 kbps, clamped to `[BITRATE_MIN .. BITRATE]`. `ABR=0` pins a fixed bitrate.
+  The client can move the **ceiling** live (`set-bitrate` control message); the
+  override persists across session rebuilds. Each tick's stats also feed the
+  client HUD via the control channel (`stats`).
 
 ---
 
@@ -195,6 +218,9 @@ wasapi2src loopback=true low-latency=true ! audioconvert ! audioresample
 | `MONITOR` | primary | Monitor index to capture + control (enumerated at startup). |
 | `AUDIO` | on | `AUDIO=0` disables system-audio capture. |
 | `CLIPBOARD` | on | `CLIPBOARD=0` disables clipboard sync. |
+| `FILES` | on | `FILES=0` disables the file-transfer channel. |
+| `FILE_DIR` | `%USERPROFILE%\Downloads` | Where received files are saved. |
+| `FILE_MAX_BYTES` | 2 GiB | Per-file size cap for received files. |
 | `ENCODER` | (auto-probe) | Force an encoder element, skip the probe (e.g. `x264enc`). |
 | `ALLOW_GPL` | off | `ALLOW_GPL=1` lets the probe auto-select the GPL `x264enc`. |
 | `CAPTURE` | (auto-probe) | Force a capture source, skip the probe. |
@@ -256,8 +282,8 @@ preview confirms the capture+encode path with zero networking, stream goes live.
 | Component | Command (in its dir) | Covers |
 | --- | --- | --- |
 | `rcd-signal` | `npm test` | `test/pairing.test.mjs` — pairing-code gen, TURN credentials, rate limit, origin allowlist (`src/pairing.ts` is pure + injectable). Also a `smoke-test.mjs`. |
-| `rcd-host` | `cargo test` | inline `#[cfg(test)]` modules — aspect-fit math (`pipeline.rs`), TURN URI percent-encoding (`webrtc.rs`), ABR AIMD (`abr.rs`), clipboard codec. |
-| `rcd-client` | `npm run build` | type-check / compile only (no Electron run in CI). |
+| `rcd-host` | `cargo test` | inline `#[cfg(test)]` modules — aspect-fit math (`pipeline.rs`), TURN URI percent-encoding (`webrtc.rs`), ABR AIMD (`abr.rs`), clipboard codec, file-frame codec + filename sanitize (`files.rs`), control JSON shapes (`control.rs`). |
+| `rcd-client` | `npm test` | `test/wire.test.mjs` — input/clipboard/file frame layouts, control-JSON parse/builders, button/scancode maps (against the compiled `dist/renderer/wire.js`). |
 
 CI (`.github/workflows/ci.yml`) on every push/PR: the Node side (signal + client) on
 Ubuntu, the Rust host on a **native ARM64 Windows** runner (`windows-11-arm`) that

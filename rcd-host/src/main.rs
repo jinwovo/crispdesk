@@ -30,11 +30,15 @@
 mod abr;
 mod audit;
 mod clipboard;
+mod control;
 mod embedded_signaling;
+mod env;
+mod files;
 mod input;
 mod monitors;
 mod pipeline;
 mod probe;
+mod sendchan;
 mod signaling;
 mod webrtc;
 
@@ -97,6 +101,9 @@ fn print_usage() {
          \x20   ABR           Set ABR=0 to pin a fixed bitrate   (default: adaptive on)\n\
          \x20   AUDIO         Set AUDIO=0 to disable system audio (default: on if available)\n\
          \x20   CLIPBOARD     Set CLIPBOARD=0 to disable clipboard sync (default: on)\n\
+         \x20   FILES         Set FILES=0 to disable file transfer (default: on)\n\
+         \x20   FILE_DIR      Where received files are saved (default %USERPROFILE%\\Downloads)\n\
+         \x20   FILE_MAX_BYTES  Per-file size cap in bytes (default 2 GiB)\n\
          \x20   SIGNAL_URL    Signaling WebSocket URL            (default \"ws://127.0.0.1:8080/ws\")\n\
          \x20   PAIRING_CODE  Room / pairing code (DEV_MODE only); else server-issued.\n\
          \x20   STUN          STUN server URI                    (default \"stun://stun.l.google.com:19302\")\n\

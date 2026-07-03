@@ -18,12 +18,25 @@ import {
   OPCODE_KEY,
   OPCODE_WHEEL,
   OPCODE_CLIPBOARD_TEXT,
+  OPCODE_FILE_OFFER,
+  OPCODE_FILE_ACCEPT,
+  OPCODE_FILE_REJECT,
+  OPCODE_FILE_CHUNK,
+  OPCODE_FILE_DONE,
   encodeMouseMoveAbs,
   encodeMouseButton,
   encodeKey,
   encodeWheel,
   encodeClipboard,
   decodeClipboard,
+  encodeFileOffer,
+  encodeFileChunk,
+  encodeFileDone,
+  encodeFileReject,
+  decodeFileReply,
+  parseControlMessage,
+  controlSwitchMonitor,
+  controlSetBitrate,
   BUTTON_MAP,
   SCANCODES,
 } from "../dist/renderer/wire.js";
@@ -197,4 +210,116 @@ test("encodeKey end-to-end via SCANCODES table entry", () => {
   // Simulate what renderer does for ArrowUp keydown: [scan, extended] from table.
   const [scan, ext] = SCANCODES.ArrowUp;
   assert.deepEqual(bytes(encodeKey(scan, true, ext)), [0x03, 0x48, 0x00, 0x03]);
+});
+
+// ---------------------------------------------------------------------------
+// "file" channel frames (must mirror rcd-host's files.rs decoder EXACTLY).
+// ---------------------------------------------------------------------------
+
+test("file opcode constants have the pinned values", () => {
+  assert.equal(OPCODE_FILE_OFFER, 0x10);
+  assert.equal(OPCODE_FILE_ACCEPT, 0x11);
+  assert.equal(OPCODE_FILE_REJECT, 0x12);
+  assert.equal(OPCODE_FILE_CHUNK, 0x13);
+  assert.equal(OPCODE_FILE_DONE, 0x14);
+});
+
+test("encodeFileOffer: [0x10][u32 id][u64 size][u16 nameLen][utf8 name], LE", () => {
+  const buf = encodeFileOffer(7, 0x1_0000_0001, "a.txt"); // size spans >32 bits
+  const dv = new DataView(buf);
+  assert.equal(dv.getUint8(0), OPCODE_FILE_OFFER);
+  assert.equal(dv.getUint32(1, true), 7);
+  assert.equal(dv.getBigUint64(5, true), 0x1_0000_0001n);
+  assert.equal(dv.getUint16(13, true), 5);
+  assert.equal(buf.byteLength, 15 + 5);
+  // Name length counts UTF-8 BYTES (Korean chars are 3 bytes each).
+  const kr = encodeFileOffer(1, 10, "한글.txt");
+  assert.equal(new DataView(kr).getUint16(13, true), 10); // 3+3+4
+});
+
+test("encodeFileChunk / encodeFileDone layouts", () => {
+  const chunk = encodeFileChunk(9, new Uint8Array([1, 2, 3]));
+  assert.deepEqual(bytes(chunk), [0x13, 0x09, 0x00, 0x00, 0x00, 1, 2, 3]);
+  assert.deepEqual(bytes(encodeFileDone(4)), [0x14, 0x04, 0x00, 0x00, 0x00]);
+});
+
+test("decodeFileReply: accept / done / reject roundtrip, malformed -> null", () => {
+  // ACCEPT and DONE are 5-byte [op][u32 id] frames — build via encode helpers
+  // where available (DONE) and by hand (ACCEPT is host->client only).
+  const accept = new Uint8Array([0x11, 0x2a, 0x00, 0x00, 0x00]).buffer;
+  assert.deepEqual(decodeFileReply(accept), { kind: "accept", id: 42 });
+  assert.deepEqual(decodeFileReply(encodeFileDone(3)), { kind: "done", id: 3 });
+  assert.deepEqual(decodeFileReply(encodeFileReject(5, "too large")), {
+    kind: "reject",
+    id: 5,
+    reason: "too large",
+  });
+  // Unknown opcode, short frames, truncated reason -> null.
+  assert.equal(decodeFileReply(new Uint8Array([0xee, 0, 0, 0, 0]).buffer), null);
+  assert.equal(decodeFileReply(new ArrayBuffer(4)), null);
+  const truncated = new Uint8Array([0x12, 1, 0, 0, 0, 50, 0, 0x61]).buffer; // claims len=50
+  assert.equal(decodeFileReply(truncated), null);
+});
+
+// ---------------------------------------------------------------------------
+// "control" channel JSON (must mirror rcd-host's control.rs serde shapes).
+// ---------------------------------------------------------------------------
+
+test("parseControlMessage accepts the pinned host shapes", () => {
+  const hello = parseControlMessage(
+    JSON.stringify({
+      type: "hello",
+      monitors: [
+        { index: 0, width: 2880, height: 1800, left: 0, top: 0, primary: true, current: true },
+      ],
+      encoder: "mfh264enc",
+      fileTransfer: true,
+      abr: { floorKbps: 1500, ceilingKbps: 12000, adaptive: true },
+    }),
+  );
+  assert.equal(hello?.type, "hello");
+  assert.equal(hello?.monitors[0].width, 2880);
+  assert.equal(hello?.fileTransfer, true);
+
+  const stats = parseControlMessage('{"type":"stats","encoderKbps":8500,"lossPct":1.2,"rttMs":12}');
+  assert.deepEqual(stats, { type: "stats", encoderKbps: 8500, lossPct: 1.2, rttMs: 12 });
+
+  assert.deepEqual(parseControlMessage('{"type":"restart","reason":"monitor-switch"}'), {
+    type: "restart",
+    reason: "monitor-switch",
+  });
+  assert.deepEqual(parseControlMessage('{"type":"error","message":"nope"}'), {
+    type: "error",
+    message: "nope",
+  });
+});
+
+test("parseControlMessage rejects malformed/unknown without throwing", () => {
+  assert.equal(parseControlMessage("not json"), null);
+  assert.equal(parseControlMessage('{"type":"future-thing"}'), null); // forward-compat
+  assert.equal(parseControlMessage('{"type":"hello","monitors":"nope"}'), null);
+  assert.equal(parseControlMessage('{"type":"stats"}'), null);
+  assert.equal(parseControlMessage("42"), null);
+});
+
+test("parseControlMessage normalizes a hello missing optional-ish fields", () => {
+  // A hello from a different host build without fileTransfer/abr must not leave
+  // undefined behind the non-optional types: fileTransfer defaults TRUE (the file
+  // channel's existence is the authoritative gate) and abr gets safe zeros.
+  const hello = parseControlMessage('{"type":"hello","monitors":[],"encoder":"x264enc"}');
+  assert.equal(hello?.type, "hello");
+  assert.equal(hello?.fileTransfer, true);
+  assert.deepEqual(hello?.abr, { floorKbps: 0, ceilingKbps: 0, adaptive: true });
+  // Explicit false is preserved; malformed abr is replaced by the default.
+  const off = parseControlMessage(
+    '{"type":"hello","monitors":[],"encoder":"x","fileTransfer":false,"abr":"nope"}',
+  );
+  assert.equal(off?.fileTransfer, false);
+  assert.deepEqual(off?.abr, { floorKbps: 0, ceilingKbps: 0, adaptive: true });
+});
+
+test("client -> host control builders emit the pinned shapes", () => {
+  assert.deepEqual(JSON.parse(controlSwitchMonitor(1)), { type: "switch-monitor", index: 1 });
+  assert.deepEqual(JSON.parse(controlSetBitrate(8000)), { type: "set-bitrate", kbps: 8000 });
+  assert.deepEqual(JSON.parse(controlSetBitrate(0)), { type: "set-bitrate", kbps: 0 });
 });

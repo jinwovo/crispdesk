@@ -9,10 +9,15 @@
 //! Using the same HMONITOR for capture and the rect for input guarantees they refer to
 //! the SAME physical monitor (index ordering across DXGI vs GDI is not guaranteed).
 //!
+//! The selection is MUTABLE at runtime: the client can ask for another monitor over
+//! the "control" DataChannel (`switch-monitor`, see control.rs), which calls
+//! [`select_index`] and rebuilds the streaming session on the new display.
+//!
 //! With per-monitor-DPI-V2 awareness (see main::set_dpi_awareness) the rect is in
 //! PHYSICAL pixels, matching the d3d11 capture — so the normalized mapping is exact.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 /// The selected monitor's capture handle + virtual-desktop pixel rect.
 #[derive(Clone, Copy, Debug)]
@@ -26,19 +31,56 @@ pub struct MonitorSel {
     pub primary: bool,
 }
 
-/// Resolved once at startup. `None` = use the primary monitor via the default path
-/// (SetCursorPos over the primary; scaled_dims via GetSystemMetrics) — i.e. unchanged.
-static SELECTED: OnceLock<Option<MonitorSel>> = OnceLock::new();
+/// The current selection: `(index into the sorted enumeration, monitor)`.
+/// `None` = use the primary monitor via the default path (SetCursorPos over the
+/// primary; scaled_dims via GetSystemMetrics) — i.e. the original behaviour.
+static SELECTED: LazyLock<Mutex<Option<(usize, MonitorSel)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
-/// The currently-selected monitor, if `MONITOR` picked a specific one.
+/// Ensures `init_from_env` only resolves the env selection once.
+static INIT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The currently-selected monitor, if one was picked (env or runtime switch).
 pub fn selected() -> Option<MonitorSel> {
-    SELECTED.get().copied().flatten()
+    SELECTED.lock().ok().and_then(|s| s.map(|(_, m)| m))
+}
+
+/// Index (into [`all`]'s ordering: primary first) of the monitor being captured.
+/// Defaults to 0 — the primary is sorted first, so "no explicit selection" == 0.
+pub fn current_index() -> usize {
+    SELECTED.lock().ok().and_then(|s| s.map(|(i, _)| i)).unwrap_or(0)
+}
+
+/// Enumerate all monitors, primary first (same ordering as `MONITOR=<index>` and
+/// the `switch-monitor` control message).
+pub fn all() -> Vec<MonitorSel> {
+    list()
+}
+
+/// Select monitor `idx` (re-enumerating first, so a display config change between
+/// sessions is picked up). Returns the monitor on success; a human-readable error
+/// (sent back to the client as a control `error`) when the index is out of range.
+pub fn select_index(idx: usize) -> Result<MonitorSel, String> {
+    let monitors = list();
+    match monitors.get(idx) {
+        Some(m) => {
+            if let Ok(mut sel) = SELECTED.lock() {
+                *sel = Some((idx, *m));
+            }
+            tracing::info!("monitor selection -> [{idx}] {}x{} at ({},{})", m.width, m.height, m.left, m.top);
+            Ok(*m)
+        }
+        None => Err(format!(
+            "monitor index {idx} out of range ({} monitor(s) detected)",
+            monitors.len()
+        )),
+    }
 }
 
 /// Read `MONITOR` from the env, enumerate displays, pick one, and log them all.
-/// Idempotent: only the first call resolves the selection.
+/// Idempotent: only the first call resolves the env selection.
 pub fn init_from_env() {
-    if SELECTED.get().is_some() {
+    if INIT_DONE.swap(true, Ordering::SeqCst) {
         return;
     }
     let monitors = list();
@@ -58,7 +100,7 @@ pub fn init_from_env() {
         Some(idx) => match monitors.get(idx) {
             Some(m) => {
                 tracing::info!("MONITOR={idx} -> capturing monitor [{idx}] ({}x{})", m.width, m.height);
-                Some(*m)
+                Some((idx, *m))
             }
             None => {
                 tracing::warn!(
@@ -71,7 +113,9 @@ pub fn init_from_env() {
         None => None, // primary, default path
     };
 
-    let _ = SELECTED.set(sel);
+    if let Ok(mut cur) = SELECTED.lock() {
+        *cur = sel;
+    }
 }
 
 #[cfg(windows)]

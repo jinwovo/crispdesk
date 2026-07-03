@@ -22,8 +22,20 @@ import {
   encodeWheel,
   encodeClipboard,
   decodeClipboard,
+  encodeFileOffer,
+  encodeFileChunk,
+  encodeFileDone,
+  encodeFileReject,
+  decodeFileReply,
+  parseControlMessage,
+  controlSwitchMonitor,
+  controlSetBitrate,
   BUTTON_MAP,
   SCANCODES,
+  type ControlMsg,
+  type FileReply,
+  type MonitorInfo,
+  type AbrInfo,
 } from "./wire.js";
 
 // ---------------------------------------------------------------------------
@@ -170,6 +182,31 @@ class ClientConnection {
   private iceRestarting = false;
   /** Grace period (ms) to wait for an ICE restart to recover before hard reset. */
   private static readonly ICE_RESTART_GRACE_MS = 4000;
+
+  // --- "control" channel (JSON): session control + host telemetry (HUD). ---
+  private controlChannel: RTCDataChannel | null = null;
+  /** Host capability/config snapshot from the control `hello`. */
+  private hostInfo: { encoder: string; abr: AbrInfo } | null = null;
+  private hostFileTransfer = false;
+  /** Latest ~1 Hz host telemetry (`stats` control message). */
+  private hostStats: { encoderKbps: number; lossPct: number; rttMs: number } | null = null;
+  /** Monitor list from the host's `hello` (kept to re-render the picker on errors). */
+  private monitors: MonitorInfo[] = [];
+  /** Previous cumulative counters for per-second rate computation (HUD). */
+  private prevRates: { ts: number; bytes: number; frames: number } | null = null;
+
+  // --- "file" channel: drag & drop uploads to the host. ---
+  private fileChannel: RTCDataChannel | null = null;
+  private nextTransferId = 1;
+  /** Replies (accept/reject/done) that arrived while nothing was awaiting them. */
+  private fileReplies = new Map<number, FileReply>();
+  private fileReplyWaiters = new Map<number, (r: FileReply) => void>();
+  private fileSendQueue: File[] = [];
+  private fileSending = false;
+  private dropCleanup: Array<() => void> = [];
+  private static readonly FILE_CHUNK_BYTES = 16 * 1024;
+  private static readonly FILE_BUFFER_HIGH = 4 * 1024 * 1024;
+  private static readonly FILE_BUFFER_LOW = 1 * 1024 * 1024;
 
   constructor(
     private readonly signalUrl: string,
@@ -368,6 +405,10 @@ class ClientConnection {
         this.attachInputChannel(ev.channel);
       } else if (ev.channel.label === "clipboard") {
         this.attachClipboardChannel(ev.channel);
+      } else if (ev.channel.label === "control") {
+        this.attachControlChannel(ev.channel);
+      } else if (ev.channel.label === "file") {
+        this.attachFileChannel(ev.channel);
       } else {
         console.warn("[rcd] unexpected data channel:", ev.channel.label);
       }
@@ -377,40 +418,108 @@ class ClientConnection {
   }
 
   /**
-   * Poll inbound-video RTP stats once per second and surface them in the status
-   * bar. This makes a black screen self-diagnosing:
-   *   bytes>0, decoded=0           -> packets arrive but the decoder rejects them
-   *                                   (H.264 profile/level mismatch) — black.
-   *   bytes=0                       -> media transport not actually delivering RTP.
-   *   decoded>0 but still black     -> a rendering/CSS problem, not WebRTC.
+   * Poll RTP/transport stats once per second: a compact line in the status bar
+   * (keeps the black-screen self-diagnosis: bytes>0+decoded=0 = decoder rejects;
+   * bytes=0 = transport dead; decoded>0 = rendering problem) plus the full HUD
+   * panel (rates, RTT, path, host encoder telemetry).
    */
   private startStats(): void {
     if (this.statsTimer) return;
+    if (!this.pc) return;
+    this.statsTimer = setInterval(() => this.pollStats(), 1000);
+  }
+
+  private pollStats(): void {
     const pc = this.pc;
     if (!pc) return;
-    this.statsTimer = setInterval(() => {
-      void pc.getStats().then((report) => {
-        let line = "";
-        report.forEach((s) => {
-          if (s.type === "inbound-rtp" && (s as { kind?: string }).kind === "video") {
-            const r = s as unknown as {
-              bytesReceived?: number;
-              framesDecoded?: number;
-              framesReceived?: number;
-              frameWidth?: number;
-              frameHeight?: number;
-              pliCount?: number;
-            };
-            const kb = Math.round((r.bytesReceived ?? 0) / 1024);
-            line =
-              `video: ${kb}KB recv, ` +
-              `${r.framesReceived ?? 0} frames, ${r.framesDecoded ?? 0} decoded, ` +
-              `${r.frameWidth ?? 0}x${r.frameHeight ?? 0}, pli=${r.pliCount ?? 0}`;
-          }
-        });
-        if (line) this.setStatus(line);
+    void pc.getStats().then((report) => {
+      // RTCStatsReport is maplike — use .get() for id lookups instead of copying
+      // the whole report into a fresh Map every second.
+      const byId = report as unknown as ReadonlyMap<string, unknown>;
+      const get = (id: unknown): Record<string, unknown> | null =>
+        typeof id === "string"
+          ? ((byId.get(id) as Record<string, unknown> | undefined) ?? null)
+          : null;
+      let inb: Record<string, unknown> | null = null;
+      let transport: Record<string, unknown> | null = null;
+      let fallbackPair: Record<string, unknown> | null = null;
+      report.forEach((s) => {
+        const st = s as unknown as Record<string, unknown>;
+        if (st.type === "inbound-rtp" && st.kind === "video") inb = st;
+        else if (st.type === "transport" && typeof st.selectedCandidatePairId === "string")
+          transport = st;
+        else if (st.type === "candidate-pair" && st.nominated === true && st.state === "succeeded")
+          fallbackPair = st;
       });
-    }, 1000);
+      const t = transport as Record<string, unknown> | null;
+      const pair = (t ? get(t.selectedCandidatePairId) : null) ?? fallbackPair;
+
+      const num = (o: Record<string, unknown> | null, k: string): number => {
+        const v = o?.[k];
+        return typeof v === "number" ? v : 0;
+      };
+
+      // Per-second rates from cumulative counters.
+      const now = performance.now();
+      const bytes = num(inb, "bytesReceived");
+      const frames = num(inb, "framesDecoded");
+      let mbps = 0;
+      let fps = 0;
+      if (this.prevRates && now > this.prevRates.ts) {
+        const dt = (now - this.prevRates.ts) / 1000;
+        mbps = ((bytes - this.prevRates.bytes) * 8) / dt / 1e6;
+        fps = (frames - this.prevRates.frames) / dt;
+      }
+      this.prevRates = { ts: now, bytes, frames };
+
+      const w = num(inb, "frameWidth");
+      const h = num(inb, "frameHeight");
+      const rttMs = num(pair, "currentRoundTripTime") * 1000;
+      const lost = num(inb, "packetsLost");
+      const pli = num(inb, "pliCount");
+      const jitterMs = num(inb, "jitter") * 1000;
+
+      // Path: TURN relay if either selected candidate is of type "relay".
+      let path = "";
+      if (pair) {
+        const cand = (k: string): string => {
+          const c = get((pair as Record<string, unknown>)[k]);
+          return typeof c?.candidateType === "string" ? (c.candidateType as string) : "";
+        };
+        const l = cand("localCandidateId");
+        const r = cand("remoteCandidateId");
+        path = l === "relay" || r === "relay" ? "TURN 릴레이" : "P2P 직결";
+      }
+
+      // Compact status line (self-diagnosis essentials survive).
+      if (inb) {
+        this.setStatus(
+          `${w}x${h} @${fps.toFixed(0)}fps · ${mbps.toFixed(1)}Mbps · ` +
+            `RTT ${rttMs.toFixed(0)}ms · loss ${lost} · pli ${pli}` +
+            (bytes === 0 ? " · (no RTP!)" : frames === 0 ? " · (no decode!)" : ""),
+        );
+      }
+
+      // Full HUD rows (client-measured + host-reported).
+      const rows: Array<[string, string]> = [
+        ["해상도", w && h ? `${w}×${h} @ ${fps.toFixed(0)}fps` : "—"],
+        ["수신", `${mbps.toFixed(1)} Mbps`],
+        ["RTT", pair ? `${rttMs.toFixed(0)} ms` : "—"],
+        ["경로", path || "—"],
+        ["손실 / PLI", `${lost} / ${pli}`],
+        ["지터", `${jitterMs.toFixed(0)} ms`],
+      ];
+      if (this.hostInfo) {
+        rows.push(["인코더", this.hostInfo.encoder]);
+      }
+      if (this.hostStats) {
+        rows.push([
+          "인코더 비트레이트",
+          `${this.hostStats.encoderKbps} kbps (손실 ${this.hostStats.lossPct}%)`,
+        ]);
+      }
+      getHud().setRows(rows);
+    });
   }
 
   private stopStats(): void {
@@ -449,7 +558,28 @@ class ClientConnection {
     });
   }
 
+  /** The `a=fingerprint:` line of an SDP — identifies the peer's DTLS identity. */
+  private static fingerprintOf(sdp: string): string | null {
+    const m = sdp.match(/^a=fingerprint:.*$/m);
+    return m ? m[0].trim() : null;
+  }
+
   private async handleOffer(msg: OfferMsg): Promise<void> {
+    // An offer from a NEW host webrtcbin (session rebuild: monitor switch, host-side
+    // restart) must start from a clean peer connection — an existing pc cannot adopt
+    // a different DTLS identity. The `restart` control message already resets the pc
+    // eagerly; this fingerprint check is the authoritative fallback when that message
+    // was lost. A same-fingerprint re-offer (ICE restart) still renegotiates on the
+    // existing pc.
+    if (this.pc) {
+      const newFp = ClientConnection.fingerprintOf(msg.sdp);
+      const curFp = this.pc.remoteDescription
+        ? ClientConnection.fingerprintOf(this.pc.remoteDescription.sdp)
+        : null;
+      if (newFp !== null && curFp !== null && newFp !== curFp) {
+        this.resetPeerConnection();
+      }
+    }
     const pc = this.ensurePeerConnection();
     try {
       await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
@@ -723,6 +853,288 @@ class ClientConnection {
   }
 
   // -------------------------------------------------------------------------
+  // Control channel (JSON): hello/stats/restart/error from the host;
+  // switch-monitor / set-bitrate to the host. Drives the HUD.
+  // -------------------------------------------------------------------------
+
+  private attachControlChannel(channel: RTCDataChannel): void {
+    this.controlChannel = channel;
+    channel.onmessage = (ev) => {
+      if (typeof ev.data !== "string") return;
+      const msg = parseControlMessage(ev.data);
+      if (msg) this.handleControl(msg);
+    };
+    channel.onopen = () => {
+      // Quality presets picked in the HUD go to the host as `set-bitrate`.
+      getHud().onBitrate = (kbps) => {
+        this.sendControl(controlSetBitrate(kbps));
+        this.setStatus(kbps === 0 ? "비트레이트: 자동(호스트 기본)" : `비트레이트 상한: ${kbps / 1000} Mbps`);
+      };
+    };
+    channel.onclose = () => {
+      if (this.controlChannel === channel) this.controlChannel = null;
+    };
+  }
+
+  private sendControl(json: string): void {
+    const ch = this.controlChannel;
+    if (ch && ch.readyState === "open") ch.send(json);
+  }
+
+  private handleControl(msg: ControlMsg): void {
+    switch (msg.type) {
+      case "hello":
+        this.hostInfo = { encoder: msg.encoder, abr: msg.abr };
+        this.hostFileTransfer = msg.fileTransfer;
+        this.monitors = msg.monitors;
+        this.renderMonitors();
+        break;
+      case "stats":
+        this.hostStats = msg;
+        break;
+      case "restart":
+        // The host is tearing down + rebuilding the WebRTC session (e.g. monitor
+        // switch). Reset now and answer the fresh offer that follows; the
+        // signaling socket stays up throughout. (If this message is lost, the
+        // offer's changed DTLS fingerprint triggers the same reset.)
+        this.setStatus(`세션 재시작(${msg.reason}) — 새 offer 대기`);
+        this.resetPeerConnection();
+        break;
+      case "error":
+        this.setStatus(`호스트 거부: ${msg.message}`);
+        // A rejected switch-monitor leaves its button disabled with a pending
+        // marker — re-render the picker so the user can try again.
+        this.renderMonitors();
+        break;
+    }
+  }
+
+  /** (Re)render the HUD monitor picker from the last `hello` list. */
+  private renderMonitors(): void {
+    if (this.monitors.length === 0) return;
+    getHud().setMonitors(this.monitors, (index) => {
+      this.setStatus(`모니터 ${index + 1}(으)로 전환 중…`);
+      this.sendControl(controlSwitchMonitor(index));
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // File channel: drag & drop files onto the stage -> chunked upload with
+  // backpressure; the host replies accept/reject and acks completion.
+  // -------------------------------------------------------------------------
+
+  private attachFileChannel(channel: RTCDataChannel): void {
+    channel.binaryType = "arraybuffer";
+    channel.bufferedAmountLowThreshold = ClientConnection.FILE_BUFFER_LOW;
+    this.fileChannel = channel;
+    channel.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const reply = decodeFileReply(ev.data);
+      if (!reply) return;
+      const waiter = this.fileReplyWaiters.get(reply.id);
+      if (waiter) {
+        waiter(reply);
+      } else {
+        this.fileReplies.set(reply.id, reply); // e.g. a mid-transfer reject
+      }
+    };
+    channel.onopen = () => this.installDropTargets();
+    channel.onclose = () => {
+      if (this.fileChannel === channel) this.fileChannel = null;
+    };
+  }
+
+  private installDropTargets(): void {
+    if (this.dropCleanup.length > 0) return;
+    const target = document.getElementById("stage") ?? document.body;
+    const onDragOver = (ev: Event): void => {
+      ev.preventDefault();
+      const de = ev as DragEvent;
+      if (de.dataTransfer) de.dataTransfer.dropEffect = "copy";
+    };
+    const onDrop = (ev: Event): void => {
+      ev.preventDefault();
+      const files = (ev as DragEvent).dataTransfer?.files;
+      if (files && files.length > 0) this.enqueueFiles(Array.from(files));
+    };
+    target.addEventListener("dragover", onDragOver);
+    target.addEventListener("drop", onDrop);
+    this.dropCleanup.push(() => {
+      target.removeEventListener("dragover", onDragOver);
+      target.removeEventListener("drop", onDrop);
+    });
+  }
+
+  private removeDropTargets(): void {
+    for (const cleanup of this.dropCleanup) cleanup();
+    this.dropCleanup = [];
+  }
+
+  private enqueueFiles(files: File[]): void {
+    if (!this.fileChannel || this.fileChannel.readyState !== "open") {
+      this.setStatus("파일 전송 불가: 파일 채널이 열려있지 않음");
+      return;
+    }
+    // Only trust the flag once the hello actually arrived (channel-open order
+    // between "file" and "control" is not guaranteed).
+    if (this.hostInfo && !this.hostFileTransfer) {
+      this.setStatus("호스트가 파일 수신을 비활성화함 (FILES=0)");
+      return;
+    }
+    this.fileSendQueue.push(...files);
+    void this.drainFileQueue();
+  }
+
+  /** Send queued files one at a time (the ordered channel is shared). */
+  private async drainFileQueue(): Promise<void> {
+    if (this.fileSending) return;
+    this.fileSending = true;
+    try {
+      let file = this.fileSendQueue.shift();
+      while (file) {
+        await this.sendOneFile(file);
+        file = this.fileSendQueue.shift();
+      }
+    } finally {
+      this.fileSending = false;
+    }
+  }
+
+  private async sendOneFile(file: File): Promise<void> {
+    const id = this.nextTransferId++;
+    const row = getHud().fileRow(file.name);
+    const ch = this.fileChannel;
+    if (!ch || ch.readyState !== "open") {
+      row.finish(false, "채널 닫힘");
+      return;
+    }
+    try {
+      ch.send(encodeFileOffer(id, file.size, file.name));
+      const verdict = await this.waitFileReply(id, 15_000);
+      if (verdict.kind !== "accept") {
+        row.finish(false, verdict.kind === "reject" ? verdict.reason : "거부됨");
+        return;
+      }
+
+      // Read in ~1 MiB blocks (one async Blob round-trip per block), then slice
+      // into 16 KiB channel frames — per-frame Blob reads cap throughput far
+      // below what the link can carry.
+      const BLOCK_BYTES = 1024 * 1024;
+      let offset = 0;
+      let lastPaint = 0;
+      while (offset < file.size) {
+        const block = new Uint8Array(
+          await file.slice(offset, offset + BLOCK_BYTES).arrayBuffer(),
+        );
+        if (block.byteLength === 0) throw new Error("파일을 읽을 수 없음 (변경/삭제됨?)");
+        for (let p = 0; p < block.byteLength; p += ClientConnection.FILE_CHUNK_BYTES) {
+          if (ch.readyState !== "open") throw new Error("연결 끊김");
+          // A mid-transfer reject from the host (write error, size breach) aborts.
+          const mid = this.fileReplies.get(id);
+          if (mid?.kind === "reject") {
+            this.fileReplies.delete(id);
+            throw new Error(mid.reason);
+          }
+          if (ch.bufferedAmount > ClientConnection.FILE_BUFFER_HIGH) {
+            await this.waitBufferedLow(ch);
+          }
+          ch.send(
+            encodeFileChunk(
+              id,
+              block.subarray(p, Math.min(p + ClientConnection.FILE_CHUNK_BYTES, block.byteLength)),
+            ),
+          );
+        }
+        offset += block.byteLength;
+        const now = performance.now();
+        if (now - lastPaint > 150 || offset >= file.size) {
+          lastPaint = now;
+          row.setProgress(file.size > 0 ? offset / file.size : 1);
+        }
+      }
+
+      ch.send(encodeFileDone(id));
+      const fin = await this.waitFileReply(id, 30_000);
+      if (fin.kind === "done") {
+        row.finish(true, "저장 완료");
+      } else {
+        row.finish(false, fin.kind === "reject" ? fin.reason : "확인 실패");
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      // Tell the host so it frees the transfer slot and deletes the .part file —
+      // otherwise a client-side failure leaks the slot for the whole session.
+      this.trySendFileReject(id, reason);
+      row.finish(false, reason);
+    } finally {
+      this.fileReplies.delete(id);
+      this.fileReplyWaiters.delete(id);
+    }
+  }
+
+  /** Best-effort client-side cancel so the host aborts + cleans up the transfer. */
+  private trySendFileReject(id: number, reason: string): void {
+    const ch = this.fileChannel;
+    if (ch && ch.readyState === "open") {
+      try {
+        ch.send(encodeFileReject(id, reason));
+      } catch {
+        /* channel died mid-send — host cleans up on session teardown */
+      }
+    }
+  }
+
+  /** Await the next host reply for transfer `id` (or one that already arrived). */
+  private waitFileReply(id: number, timeoutMs: number): Promise<FileReply> {
+    const existing = this.fileReplies.get(id);
+    if (existing) {
+      this.fileReplies.delete(id);
+      return Promise.resolve(existing);
+    }
+    return new Promise<FileReply>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.fileReplyWaiters.delete(id);
+        reject(new Error("호스트 응답 시간 초과"));
+      }, timeoutMs);
+      this.fileReplyWaiters.set(id, (reply) => {
+        clearTimeout(timer);
+        this.fileReplyWaiters.delete(id);
+        resolve(reply);
+      });
+    });
+  }
+
+  /** Resolve when the channel's send buffer drains below the low-water mark. */
+  private waitBufferedLow(ch: RTCDataChannel): Promise<void> {
+    return new Promise((resolve) => {
+      let poll: ReturnType<typeof setInterval> | null = null;
+      const done = (): void => {
+        ch.removeEventListener("bufferedamountlow", done);
+        if (poll) clearInterval(poll);
+        resolve();
+      };
+      ch.addEventListener("bufferedamountlow", done);
+      // Poll as a backstop: the event can be missed if the buffer already drained.
+      poll = setInterval(() => {
+        if (ch.readyState !== "open" || ch.bufferedAmount <= ch.bufferedAmountLowThreshold) {
+          done();
+        }
+      }, 200);
+    });
+  }
+
+  /** Fail any transfer still waiting on a host reply (session went away). */
+  private failPendingFileTransfers(reason: string): void {
+    const waiters = [...this.fileReplyWaiters.values()];
+    this.fileReplyWaiters.clear();
+    this.fileReplies.clear();
+    this.fileSendQueue = [];
+    for (const w of waiters) {
+      w({ kind: "reject", id: 0, reason });
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Reconnect: ICE restart with a one-shot fallback to a full reset.
   // -------------------------------------------------------------------------
 
@@ -792,6 +1204,15 @@ class ClientConnection {
     this.stopClipboardSync();
     this.clipboardChannel = null;
     this.lastClipboard = null;
+    // Control/file channels die with the pc; fail in-flight transfers cleanly.
+    this.failPendingFileTransfers("세션 종료");
+    this.removeDropTargets();
+    this.controlChannel = null;
+    this.fileChannel = null;
+    this.hostStats = null;
+    this.monitors = [];
+    this.prevRates = null;
+    getHud().clearSession();
     this.removeInputListeners();
     if (this.inputChannel) {
       try {
@@ -842,6 +1263,228 @@ class ClientConnection {
 }
 
 // ---------------------------------------------------------------------------
+// HUD overlay (stats / monitor picker / bitrate presets / file progress).
+//
+// Built ENTIRELY from the renderer so every page that loads renderer.js gets it
+// — the Electron index.html, rcd-signal's served test page, and any future page
+// — without duplicating HTML. Interactions here never reach the host input path
+// (mouse listeners live on the <video>; keyboard pauses while a form control has
+// focus via typingInUi()).
+// ---------------------------------------------------------------------------
+
+const HUD_CSS = `
+  #rcdHudBtn { position:absolute; top:8px; right:8px; z-index:20; width:34px; height:30px;
+    border:1px solid #33333a; border-radius:6px; background:rgba(27,27,31,.8); color:#eee;
+    font-size:15px; cursor:pointer; opacity:.45; }
+  #rcdHudBtn:hover, #rcdHudBtn.open { opacity:1; }
+  #rcdHud { position:absolute; top:44px; right:8px; z-index:20; min-width:250px; max-width:320px;
+    background:rgba(20,20,24,.93); border:1px solid #33333a; border-radius:8px; padding:10px 12px;
+    font-size:12px; color:#ddd; display:none; }
+  #rcdHud.open { display:block; }
+  #rcdHud h4 { margin:8px 0 4px; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+    color:#8a8a95; font-weight:600; }
+  #rcdHud h4:first-child { margin-top:0; }
+  #rcdHud table { width:100%; border-collapse:collapse; }
+  #rcdHud td { padding:1px 0; vertical-align:top; }
+  #rcdHud td:first-child { color:#9a9aa5; padding-right:10px; white-space:nowrap; }
+  #rcdHud td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
+  .rcdMonBtn { margin:2px 4px 2px 0; padding:3px 8px; font-size:12px; border-radius:4px;
+    border:1px solid #3a3a44; background:#26262c; color:#ddd; cursor:pointer; }
+  .rcdMonBtn.current { border-color:#2d6cdf; background:#20304f; cursor:default; }
+  #rcdHud select { width:100%; margin-top:2px; background:#101014; color:#eee;
+    border:1px solid #33333a; border-radius:4px; padding:3px 4px; font-size:12px; }
+  #rcdHud .rcdHint { color:#77777f; margin-top:6px; font-size:11px; }
+  #rcdFiles { position:absolute; left:8px; bottom:8px; z-index:20; display:flex;
+    flex-direction:column; gap:4px; max-width:340px; font-size:12px; }
+  .rcdFileRow { background:rgba(20,20,24,.93); border:1px solid #33333a; border-radius:6px;
+    padding:5px 9px; color:#ddd; display:flex; gap:8px; align-items:center; }
+  .rcdFileRow .n { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:200px; }
+  .rcdFileRow .p { margin-left:auto; font-variant-numeric:tabular-nums; color:#9a9aa5; }
+  .rcdFileRow.ok .p { color:#4caf7d; }
+  .rcdFileRow.err .p { color:#e06c75; }
+`;
+
+/** A live progress row for one outgoing file. */
+interface FileRowHandle {
+  setProgress(frac: number): void;
+  finish(ok: boolean, label: string): void;
+}
+
+class HudOverlay {
+  private readonly panel: HTMLDivElement;
+  private readonly button: HTMLButtonElement;
+  private readonly statsTable: HTMLTableElement;
+  private readonly monitorsBox: HTMLDivElement;
+  private readonly filesBox: HTMLDivElement;
+  /** Value cells keyed by row label — rows update in place between rebuilds. */
+  private readonly rowCells = new Map<string, HTMLTableCellElement>();
+  private rowSignature = "";
+  /** Set by the connection while its control channel is open. */
+  onBitrate: ((kbps: number) => void) | null = null;
+
+  constructor(container: HTMLElement) {
+    const style = document.createElement("style");
+    style.textContent = HUD_CSS;
+    document.head.appendChild(style);
+
+    this.button = document.createElement("button");
+    this.button.id = "rcdHudBtn";
+    this.button.type = "button";
+    this.button.title = "통계 / 세션 설정";
+    this.button.textContent = "📊";
+    this.button.addEventListener("click", () => {
+      const open = this.panel.classList.toggle("open");
+      this.button.classList.toggle("open", open);
+    });
+
+    this.panel = document.createElement("div");
+    this.panel.id = "rcdHud";
+
+    const statsTitle = document.createElement("h4");
+    statsTitle.textContent = "통계";
+    this.statsTable = document.createElement("table");
+
+    const monTitle = document.createElement("h4");
+    monTitle.textContent = "모니터";
+    this.monitorsBox = document.createElement("div");
+    this.monitorsBox.textContent = "연결 후 표시됩니다";
+
+    const brTitle = document.createElement("h4");
+    brTitle.textContent = "품질 (비트레이트 상한)";
+    const select = document.createElement("select");
+    for (const [label, kbps] of [
+      ["자동 (호스트 기본)", 0],
+      ["3 Mbps — 절약", 3000],
+      ["5 Mbps", 5000],
+      ["8 Mbps", 8000],
+      ["12 Mbps — 기본 상한", 12000],
+      ["20 Mbps — 고품질", 20000],
+      ["30 Mbps — 최고", 30000],
+    ] as const) {
+      const opt = document.createElement("option");
+      opt.value = String(kbps);
+      opt.textContent = label;
+      select.appendChild(opt);
+    }
+    select.addEventListener("change", () => {
+      this.onBitrate?.(Number(select.value));
+    });
+
+    const hint = document.createElement("div");
+    hint.className = "rcdHint";
+    hint.textContent = "파일을 화면에 드래그하면 호스트 다운로드 폴더로 전송됩니다.";
+
+    this.panel.append(statsTitle, this.statsTable, monTitle, this.monitorsBox, brTitle, select, hint);
+
+    this.filesBox = document.createElement("div");
+    this.filesBox.id = "rcdFiles";
+
+    container.append(this.button, this.panel, this.filesBox);
+  }
+
+  /** Fill the stats table with `rows` of [label, value]. Rows are rebuilt only when
+   *  the label set changes; otherwise values update in place (no per-second DOM
+   *  churn next to a 60fps video). */
+  setRows(rows: Array<[string, string]>): void {
+    if (!this.panel.classList.contains("open")) return; // no work while hidden
+    const signature = rows.map(([k]) => k).join("|");
+    if (signature !== this.rowSignature) {
+      this.rowSignature = signature;
+      this.rowCells.clear();
+      this.statsTable.replaceChildren(
+        ...rows.map(([k, v]) => {
+          const tr = document.createElement("tr");
+          const kd = document.createElement("td");
+          kd.textContent = k;
+          const vd = document.createElement("td");
+          vd.textContent = v;
+          tr.append(kd, vd);
+          this.rowCells.set(k, vd);
+          return tr;
+        }),
+      );
+      return;
+    }
+    for (const [k, v] of rows) {
+      const cell = this.rowCells.get(k);
+      if (cell && cell.textContent !== v) cell.textContent = v;
+    }
+  }
+
+  /** Render the monitor picker from the host's `hello`. */
+  setMonitors(monitors: MonitorInfo[], onSwitch: (index: number) => void): void {
+    this.monitorsBox.replaceChildren(
+      ...monitors.map((m) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "rcdMonBtn" + (m.current ? " current" : "");
+        b.textContent = `${m.index + 1}: ${m.width}×${m.height}${m.primary ? " ★" : ""}`;
+        b.title = m.current ? "현재 캡처 중" : "이 모니터로 전환";
+        if (!m.current) {
+          b.addEventListener("click", () => {
+            // Lock the whole row while the switch is in flight — a second click on
+            // another monitor would queue a second full session rebuild.
+            for (const el of this.monitorsBox.querySelectorAll("button")) {
+              (el as HTMLButtonElement).disabled = true;
+            }
+            b.textContent += " …";
+            onSwitch(m.index);
+          });
+        } else {
+          b.disabled = true;
+        }
+        return b;
+      }),
+    );
+  }
+
+  /** Connection went away: clear per-session content (panel stays available). */
+  clearSession(): void {
+    this.statsTable.replaceChildren();
+    this.rowCells.clear();
+    this.rowSignature = "";
+    this.monitorsBox.replaceChildren();
+    this.monitorsBox.textContent = "연결 후 표시됩니다";
+    this.onBitrate = null;
+  }
+
+  /** Add a progress row for one outgoing file. */
+  fileRow(name: string): FileRowHandle {
+    const row = document.createElement("div");
+    row.className = "rcdFileRow";
+    const n = document.createElement("span");
+    n.className = "n";
+    n.textContent = name;
+    const p = document.createElement("span");
+    p.className = "p";
+    p.textContent = "0%";
+    row.append(n, p);
+    this.filesBox.appendChild(row);
+    return {
+      setProgress: (frac: number): void => {
+        p.textContent = `${Math.min(100, Math.round(frac * 100))}%`;
+      },
+      finish: (ok: boolean, label: string): void => {
+        row.classList.add(ok ? "ok" : "err");
+        p.textContent = ok ? `✓ ${label}` : `✗ ${label}`;
+        setTimeout(() => row.remove(), ok ? 6000 : 12000);
+      },
+    };
+  }
+}
+
+let hudSingleton: HudOverlay | null = null;
+
+/** The page-wide HUD singleton (main() creates it eagerly at startup; lazy here
+ *  only so module-load order can never bite). */
+function getHud(): HudOverlay {
+  if (!hudSingleton) {
+    hudSingleton = new HudOverlay(document.getElementById("stage") ?? document.body);
+  }
+  return hudSingleton;
+}
+
+// ---------------------------------------------------------------------------
 // Wire up the control bar.
 // ---------------------------------------------------------------------------
 
@@ -860,6 +1503,15 @@ function main(): void {
     statusEl.textContent = s;
     console.log("[rcd]", s);
   };
+
+  // Build the HUD up front so the 📊 toggle is discoverable before connecting.
+  getHud();
+
+  // Block the default drop behaviour EVERYWHERE (Electron would otherwise
+  // navigate to the dropped file's URL, replacing the app). The stage's own
+  // drop handler (installed while the file channel is open) does the upload.
+  window.addEventListener("dragover", (ev) => ev.preventDefault());
+  window.addEventListener("drop", (ev) => ev.preventDefault());
 
   let conn: ClientConnection | null = null;
 

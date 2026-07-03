@@ -7,12 +7,14 @@ picture instead of a mushy one). Run one host on the machine you want to control
 and one client on the machine you're sitting at; they pair with a short code and
 connect peer-to-peer through a small signaling server.
 
-> **Status — working Milestone 1.** The full loop runs end-to-end over LAN and
+> **Status — working Milestone 1+.** The full loop runs end-to-end over LAN and
 > over Tailscale today: the host captures the screen, **hardware-encodes** H.264,
 > streams **video + system audio** over WebRTC to a browser/Electron client that
 > hardware-decodes and displays it, while the client sends **mouse, keyboard, and
-> wheel** input back over a DataChannel. Cross-NAT-via-TURN (M1b) and adaptive
-> bitrate (M2) are next.
+> wheel** input back over a DataChannel. On top of that: **adaptive bitrate** (M2),
+> bidirectional **clipboard sync**, an in-session **stats HUD** with live **quality
+> presets**, **client-driven monitor switching**, and **drag & drop file transfer**
+> to the host. Cross-NAT-via-TURN (M1b) is code-wired and needs a coturn server.
 
 ---
 
@@ -30,6 +32,13 @@ connect peer-to-peer through a small signaling server.
   Snapdragon X (ARM64-native) using the Adreno hardware encoder.
 - **Sharp by default:** 1080p @ 12 Mbps H.264 with GPU scaling; resolution and
   bitrate are tunable per session.
+- **In-session controls (📊 HUD):** the client overlay shows live stats
+  (resolution/fps, receive bitrate, RTT, loss, P2P-vs-TURN path, host encoder
+  telemetry), switches the **captured monitor** without reconnecting by hand, and
+  moves the **bitrate ceiling** live (`자동`/3/5/8/12/20/30 Mbps presets).
+- **File transfer:** drag files onto the client window — they land in the host's
+  Downloads folder (size-capped, name-sanitized, consent-gated; `FILES=0` to
+  disable).
 
 ---
 
@@ -126,7 +135,10 @@ Useful host env vars:
 | `MONITOR`    | primary                  | Monitor index to capture + control (enumerated at startup).|
 | `AUDIO`      | on                       | `AUDIO=0` disables system-audio capture.                  |
 | `CLIPBOARD`  | on                       | `CLIPBOARD=0` disables clipboard sync.                    |
-| `REQUIRE_CONSENT` | off                 | `REQUIRE_CONSENT=1` blocks injected input + inbound clipboard until the seated user approves a per-session consent dialog. |
+| `FILES`      | on                       | `FILES=0` disables file transfer (drag & drop to host).   |
+| `FILE_DIR`   | `%USERPROFILE%\Downloads`| Where received files are saved.                           |
+| `FILE_MAX_BYTES` | 2 GiB                | Per-file size cap for received files.                     |
+| `REQUIRE_CONSENT` | off                 | `REQUIRE_CONSENT=1` blocks injected input, inbound clipboard, file receipt, and control commands until the seated user approves a per-session consent dialog. |
 | `LOCK_ON_DISCONNECT` | off              | `LOCK_ON_DISCONNECT=1` locks the workstation when the remote peer leaves. |
 | `AUDIT_LOG`  | `%LOCALAPPDATA%\crispdesk\audit.jsonl` | Session-event JSONL path; `AUDIT_LOG=off` disables. |
 | `ENCODER`    | (auto-probe)             | Force an encoder, e.g. `x264enc`.                         |
@@ -191,8 +203,8 @@ npm start              # UI: Signaling URL, Pairing Code, Connect
 
 ```powershell
 cd rcd-signal; npm test    # pairing code / TURN credential / rate-limit / origin allowlist (9)
-cd rcd-client; npm test    # wire-format encoders/decoders, clipboard codec, button/scancode maps (18)
-cd rcd-host;   cargo test   # clipboard codec, ABR AIMD, TURN URI, aspect-fit math (6)
+cd rcd-client; npm test    # wire-format encoders/decoders (input/clipboard/file), control JSON, maps (26)
+cd rcd-host;   cargo test   # clipboard/file codecs, filename sanitize, control JSON, ABR, TURN URI, aspect-fit (13)
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) builds + tests all three components on
@@ -224,6 +236,11 @@ runner with GStreamer installed.
 - [x] **Dynamic pairing codes** (random, TTL, per-IP rate-limit) replacing the fixed code.
 - [x] **Robustness:** signaling auto-reconnect + keepalive; host stuck-key release on
       disconnect; per-monitor **DPI awareness**; client **jitter-buffer** latency tuning.
+- [x] **Control channel** (`"control"`, JSON): stats HUD (client + host telemetry),
+      **client-driven monitor switching** (session rebuild over live signaling), live
+      **bitrate-ceiling presets** that survive rebuilds. See PROTOCOL.md §2.5.
+- [x] **File transfer** (`"file"`): drag & drop client→host with backpressure,
+      sanitized names, size cap, consent gating, `.part`+rename. See PROTOCOL.md §2.6.
 
 ### M1b — cross-NAT via TURN — **code wired; needs a coturn deployment**
 
@@ -243,19 +260,18 @@ runner with GStreamer installed.
       `DISABLE_TEST_PAGE`, **wss/TLS** (`TLS_CERT`/`TLS_KEY`), WS frame cap, Origin
       allowlist; host-side **consent dialog** (`REQUIRE_CONSENT`), **audit log**, and
       `LOCK_ON_DISCONNECT`.
-- [x] **Automated tests + CI** foundation (33 tests; see Testing above).
+- [x] **Automated tests + CI** foundation (48 tests; see Testing above).
 - [x] **electron-builder** packaging config (`npm run dist` after installing it).
+- [x] **File transfer** (client→host) and **client-driven monitor switching**.
 - [ ] Code-signing cert + notarization + auto-update (needs a cert).
 - [ ] Host as a **Windows service** (control the UAC/secure desktop, run on boot).
 - [ ] Account/identity (persistent), config UI; H.264 royalty strategy.
-- [ ] File transfer; client-driven monitor switching; macOS host.
+- [ ] Host→client file transfer; clipboard images; macOS host.
 
 ---
 
 ## Honest caveats
 
-- **No adaptive bitrate yet.** A fixed encoder bitrate is used; congestion
-  control is M2.
 - **TURN is required for many real networks.** STUN alone won't punch through
   symmetric NAT or Korean CGNAT; a VPS + coturn (M1b) is needed there. Tailscale
   is only a convenient test transport today.

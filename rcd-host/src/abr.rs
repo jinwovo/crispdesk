@@ -17,8 +17,66 @@
 //! field (which isn't always exposed). Stats access is via the synchronous
 //! `get-stats` + `Promise::wait`, which is safe to call from any thread.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use gstreamer as gst;
 use gstreamer::prelude::*;
+
+/// Hard sanity bounds for a client-requested ceiling (kbps).
+const CEILING_MIN_KBPS: u32 = 500;
+const CEILING_MAX_KBPS: u32 = 100_000;
+
+/// Client-requested bitrate ceiling (kbps), persisted ACROSS session rebuilds (e.g. a
+/// monitor switch tears the session down; the user's quality choice must survive it).
+/// 0 = no override (use the `BITRATE` env ceiling).
+static CEILING_OVERRIDE_KBPS: AtomicU32 = AtomicU32::new(0);
+
+/// One tick's stats, surfaced to the client HUD over the "control" DataChannel.
+#[derive(Clone, Copy, Debug)]
+pub struct AbrStats {
+    /// The encoder bitrate currently in force (kbps).
+    pub kbps: u32,
+    /// Packet loss over the last interval, in PERCENT (0..100).
+    pub loss_pct: f64,
+    /// RTCP round-trip time in milliseconds.
+    pub rtt_ms: f64,
+}
+
+fn env_ceiling_kbps() -> u32 {
+    crate::env::parse_or("BITRATE", 12000)
+}
+
+fn env_floor_kbps() -> u32 {
+    crate::env::parse_or("BITRATE_MIN", 1500)
+}
+
+fn env_adaptive() -> bool {
+    crate::env::on("ABR")
+}
+
+/// The effective ceiling: the client override when set, else the `BITRATE` env.
+fn effective_ceiling_kbps() -> u32 {
+    match CEILING_OVERRIDE_KBPS.load(Ordering::Relaxed) {
+        0 => env_ceiling_kbps(),
+        o => o,
+    }
+}
+
+/// Forget the client's ceiling override. Called when the peer that set it LEAVES —
+/// the override should survive internal session rebuilds (monitor switch) but must
+/// not silently cap the next client's session.
+pub fn clear_override() {
+    if CEILING_OVERRIDE_KBPS.swap(0, Ordering::Relaxed) != 0 {
+        tracing::info!("client bitrate override cleared (peer left)");
+    }
+}
+
+/// `(floor_kbps, ceiling_kbps, adaptive)` — the config reported in the control
+/// channel's `hello` (readable before/without a live `AbrState`).
+pub fn current_config() -> (u32, u32, bool) {
+    let ceiling = effective_ceiling_kbps();
+    (env_floor_kbps().min(ceiling), ceiling, env_adaptive())
+}
 
 pub struct AbrState {
     enabled: bool,
@@ -34,18 +92,12 @@ pub struct AbrState {
 }
 
 impl AbrState {
-    /// Start at the configured `BITRATE` (also the ceiling); floor at `BITRATE_MIN`
-    /// (default 1500 kbps). `ABR=0` disables adaptation entirely.
+    /// Start at the effective ceiling (client override, else `BITRATE`); floor at
+    /// `BITRATE_MIN` (default 1500 kbps). `ABR=0` disables adaptation entirely.
     pub fn new(enc_name: String) -> Self {
-        let max = std::env::var("BITRATE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(12000);
-        let min = std::env::var("BITRATE_MIN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1500);
-        let enabled = std::env::var("ABR").as_deref() != Ok("0");
+        let max = effective_ceiling_kbps();
+        let min = env_floor_kbps();
+        let enabled = env_adaptive();
         if !enabled {
             tracing::info!("ABR=0 -> adaptive bitrate disabled (fixed {max} kbps)");
         } else {
@@ -63,20 +115,64 @@ impl AbrState {
         }
     }
 
-    /// One control tick: read stats, run AIMD, apply the new bitrate to `venc`.
-    pub fn tick(&mut self, webrtcbin: &gst::Element, venc: &gst::Element) {
-        if !self.enabled {
-            return;
-        }
-        let Some((sent, lost, rtt)) = read_loss(webrtcbin) else {
-            return; // no sender/receiver-report stats yet
+    /// Push the current target to the encoder UNCONDITIONALLY. Called once at session
+    /// start: a rebuilt pipeline's encoder comes up at its tuning-string default, and
+    /// neither AIMD (which only writes on a CHANGE) nor `ABR=0` (which never writes)
+    /// would otherwise ever apply a persisted client ceiling to the new element.
+    pub fn apply(&self, venc: &gst::Element) {
+        set_encoder_bitrate(venc, &self.enc_name, self.target_kbps);
+    }
+
+    /// Apply a client-requested bitrate ceiling LIVE (control message `set-bitrate`).
+    /// `kbps == 0` clears the override back to the `BITRATE` env default. With ABR on,
+    /// this moves the AIMD ceiling (the target is re-clamped and keeps adapting below
+    /// it); with `ABR=0` the fixed bitrate is set directly. Persists across rebuilds.
+    pub fn set_ceiling(&mut self, venc: &gst::Element, kbps: u32) {
+        let clamped = if kbps == 0 { 0 } else { kbps.clamp(CEILING_MIN_KBPS, CEILING_MAX_KBPS) };
+        CEILING_OVERRIDE_KBPS.store(clamped, Ordering::Relaxed);
+
+        self.max_kbps = effective_ceiling_kbps();
+        self.min_kbps = env_floor_kbps().min(self.max_kbps);
+        let before = self.target_kbps;
+        self.target_kbps = if self.enabled {
+            // Adaptive: drop under a lowered ceiling immediately; climb via AIMD.
+            self.target_kbps.clamp(self.min_kbps, self.max_kbps)
+        } else {
+            // Fixed mode: the ceiling IS the bitrate.
+            self.max_kbps
         };
+        if self.target_kbps != before {
+            set_encoder_bitrate(venc, &self.enc_name, self.target_kbps);
+        }
+        tracing::info!(
+            "bitrate ceiling -> {} kbps (client request {kbps}; target {} kbps)",
+            self.max_kbps,
+            self.target_kbps
+        );
+    }
+
+    /// One control tick: read stats, run AIMD (when enabled), apply the new bitrate to
+    /// `venc`. Returns the interval's stats for the client HUD (also when `ABR=0` —
+    /// stats reporting works with adaptation pinned). `stats_wanted` = a consumer (the
+    /// control channel) exists; with `ABR=0` AND no consumer this never touches
+    /// webrtcbin at all — preserving the original escape-hatch guarantee that a
+    /// pinned-bitrate host does zero per-second stats work.
+    pub fn tick(
+        &mut self,
+        webrtcbin: &gst::Element,
+        venc: &gst::Element,
+        stats_wanted: bool,
+    ) -> Option<AbrStats> {
+        if !self.enabled && !stats_wanted {
+            return None;
+        }
+        let (sent, lost, rtt) = read_loss(webrtcbin)?;
 
         if !self.primed {
             self.prev_sent = sent;
             self.prev_lost = lost;
             self.primed = true;
-            return; // need two samples for a delta
+            return None; // need two samples for a delta
         }
 
         let d_sent = sent.saturating_sub(self.prev_sent);
@@ -85,23 +181,31 @@ impl AbrState {
         self.prev_lost = lost;
 
         if d_sent == 0 {
-            return; // nothing sent this interval; don't react to noise
+            return None; // nothing sent this interval; don't react to noise
         }
         let frac = d_lost as f64 / (d_sent + d_lost) as f64;
 
-        let before = self.target_kbps;
-        self.target_kbps = aimd_step(self.target_kbps, frac, self.min_kbps, self.max_kbps);
+        if self.enabled {
+            let before = self.target_kbps;
+            self.target_kbps = aimd_step(self.target_kbps, frac, self.min_kbps, self.max_kbps);
 
-        if self.target_kbps != before {
-            set_encoder_bitrate(venc, &self.enc_name, self.target_kbps);
+            if self.target_kbps != before {
+                set_encoder_bitrate(venc, &self.enc_name, self.target_kbps);
+            }
+            tracing::info!(
+                "abr: loss={:.1}% rtt={:.0}ms bitrate={}kbps{}",
+                frac * 100.0,
+                rtt * 1000.0,
+                self.target_kbps,
+                if self.target_kbps != before { " (changed)" } else { "" },
+            );
         }
-        tracing::info!(
-            "abr: loss={:.1}% rtt={:.0}ms bitrate={}kbps{}",
-            frac * 100.0,
-            rtt * 1000.0,
-            self.target_kbps,
-            if self.target_kbps != before { " (changed)" } else { "" },
-        );
+
+        Some(AbrStats {
+            kbps: self.target_kbps,
+            loss_pct: frac * 100.0,
+            rtt_ms: rtt * 1000.0,
+        })
     }
 }
 

@@ -18,7 +18,8 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use gstreamer::glib;
-use gstreamer::prelude::*;
+
+use crate::sendchan::ChannelSlot;
 
 /// PROTOCOL.md opcode 0x06 CLIPBOARD_TEXT: [u8 0x06][u32 len LE][utf8 text].
 const OPCODE_CLIPBOARD_TEXT: u8 = 0x06;
@@ -27,49 +28,34 @@ const OPCODE_CLIPBOARD_TEXT: u8 = 0x06;
 static LAST_SYNCED: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 /// The current session's "clipboard" DataChannel (host -> client send path).
-static CURRENT_CLIP: LazyLock<Mutex<Option<SendChannel>>> = LazyLock::new(|| Mutex::new(None));
+static CURRENT_CLIP: ChannelSlot = ChannelSlot::new();
 
 /// Ensures the poller thread is only spawned once for the process lifetime.
 static POLLER_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// A DataChannel handle we can store across threads. GstWebRTCDataChannel's `send-data`
-/// is internally thread-safe and GObject ref/unref is atomic, so sending from the poller
-/// thread is sound; the Rust binding just isn't auto-`Send`, hence this asserting wrapper.
-struct SendChannel(glib::Object);
-// SAFETY: see the struct doc — only `send-data` is invoked, which GStreamer serializes.
-unsafe impl Send for SendChannel {}
-unsafe impl Sync for SendChannel {}
-
-impl SendChannel {
-    fn send(&self, bytes: &glib::Bytes) {
-        self.0.emit_by_name::<()>("send-data", &[bytes]);
-    }
-}
-
 /// Clipboard sync is on unless `CLIPBOARD=0`.
 pub fn enabled() -> bool {
-    std::env::var("CLIPBOARD").as_deref() != Ok("0")
+    crate::env::on("CLIPBOARD")
 }
 
 fn poll_ms() -> u64 {
-    std::env::var("CLIPBOARD_POLL_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(500)
+    crate::env::parse_or("CLIPBOARD_POLL_MS", 500)
 }
 
 fn max_bytes() -> usize {
-    std::env::var("CLIPBOARD_MAX_BYTES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(102_400)
+    crate::env::parse_or("CLIPBOARD_MAX_BYTES", 102_400)
 }
 
 /// Register (or clear with `None`) the current session's clipboard channel.
 pub fn set_channel(dc: Option<glib::Object>) {
-    if let Ok(mut cur) = CURRENT_CLIP.lock() {
-        *cur = dc.map(SendChannel);
-    }
+    CURRENT_CLIP.set(dc);
+}
+
+/// Clear the registration only if `dc` IS the currently-registered channel. An old
+/// session's channel can close asynchronously AFTER a rebuilt session registered its
+/// own; that stale close must not clobber the live handle.
+pub fn clear_channel_if(dc: &glib::Object) {
+    CURRENT_CLIP.clear_if(dc);
 }
 
 /// Read the Windows clipboard text (None if empty / non-text / unavailable).
@@ -165,11 +151,8 @@ pub fn start_poller() {
         }
 
         let frame = encode(&cur);
-        if let Ok(guard) = CURRENT_CLIP.lock() {
-            if let Some(ch) = guard.as_ref() {
-                ch.send(&glib::Bytes::from_owned(frame));
-                tracing::debug!("clipboard -> client ({} bytes)", cur.len());
-            }
+        if CURRENT_CLIP.send_data(glib::Bytes::from_owned(frame)) {
+            tracing::debug!("clipboard -> client ({} bytes)", cur.len());
         }
     });
 }
